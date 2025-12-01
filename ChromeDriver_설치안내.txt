@@ -1,0 +1,38 @@
+========================================
+ChromeDriver 설치 안내
+========================================
+
+Cloudflare 보안을 우회하기 위해 Selenium을 사용합니다.
+Chrome 브라우저와 ChromeDriver가 필요합니다.
+
+========================================
+설치 방법
+========================================
+
+1. Chrome 브라우저 설치 확인
+   - Chrome이 설치되어 있어야 합니다
+   - https://www.google.com/chrome/
+
+2. ChromeDriver 설치
+   
+   방법 A: 자동 설치 (권장)
+   - webdriver-manager 패키지 사용
+   - pip install webdriver-manager
+   
+   방법 B: 수동 설치
+   - Chrome 버전 확인: chrome://version/
+   - ChromeDriver 다운로드: https://chromedriver.chromium.org/
+   - PATH에 추가하거나 프로젝트 폴더에 저장
+
+========================================
+자동 설치 (권장)
+========================================
+
+다음 명령어 실행:
+
+py -m pip install webdriver-manager
+
+그러면 ChromeDriver가 자동으로 관리됩니다.
+
+========================================
+

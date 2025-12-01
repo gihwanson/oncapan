@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 환경 변수
+.env
+.venv
+
+# 설정 파일 (민감 정보 포함)
+config.json
+key.key
+
+# 로그 파일
+*.log
+error.log
+learning_log.txt
+debug_page_source_*.html
+
+# 수집된 데이터
+collected_comments.json
+comment_analysis.json
+realtime_learning_data.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ChromeDriver
+chromedriver.exe
+chromedriver
+
+# 임시 파일
+*.tmp
+*.bak
+

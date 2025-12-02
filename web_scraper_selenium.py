@@ -272,9 +272,46 @@ class OncaPanScraperSelenium:
             
             content_text = content.get_text(strip=True) if content else ""
             
+            # 게시글 제목 추출
+            title = None
+            title_selectors = [
+                ('h2', {'id': 'bo_v_title'}),
+                ('span', {'class': 'bo_v_tit'}),
+                ('h1', {}),
+                ('h2', {}),
+                ('div', {'id': 'bo_v_title'}),
+                ('div', {'class': 'title'}),
+            ]
+            
+            for tag, attrs in title_selectors:
+                title_elem = soup.find(tag, attrs) if attrs else soup.find(tag)
+                if title_elem:
+                    # span.bo_v_tit이 h2 안에 있을 수 있으므로 확인
+                    if tag == 'h2' and attrs.get('id') == 'bo_v_title':
+                        span = title_elem.find('span', class_='bo_v_tit')
+                        if span:
+                            title = span.get_text(strip=True)
+                        else:
+                            title = title_elem.get_text(strip=True)
+                    else:
+                        title = title_elem.get_text(strip=True)
+                    if title:
+                        break
+            
+            # 제목을 찾지 못한 경우 title 태그에서 추출 시도
+            if not title:
+                title_tag = soup.find('title')
+                if title_tag:
+                    title_text = title_tag.get_text(strip=True)
+                    # "제목 > 온카판 > ..." 형태에서 제목 부분만 추출
+                    if '>' in title_text:
+                        title = title_text.split('>')[0].strip()
+                    else:
+                        title = title_text
+            
             return {
                 'content': content_text,
-                'title': '',
+                'title': title or '',
                 'soup': soup
             }
             

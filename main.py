@@ -18,31 +18,30 @@ logging.basicConfig(
 
 def main():
     """메인 함수"""
+    import sys
+    import os
+    
+    # 오류 발생 시에도 콘솔에 출력되도록 설정
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    
     try:
-        import sys
-        import os
         
-        # Python 버전 확인
+        # Python 버전 확인 (경고만 표시, 실제 작동 여부는 테스트)
         python_version = sys.version_info
         if python_version.major == 3 and python_version.minor >= 13:
-            error_msg = (
-                "Python 3.13에서는 tkinter가 제대로 작동하지 않을 수 있습니다.\n\n"
-                "해결 방법:\n"
-                "1. Python 3.11 또는 3.12를 설치하세요\n"
-                "2. 설치 시 'tcl/tk and IDLE' 옵션을 반드시 선택하세요\n"
-                "3. Python_재설치_필수.txt 파일을 참고하세요\n\n"
-                "Python 다운로드: https://www.python.org/downloads/"
+            warning_msg = (
+                f"Python {python_version.major}.{python_version.minor}을 사용 중입니다.\n"
+                "일부 버전에서는 tkinter가 제대로 작동하지 않을 수 있습니다.\n\n"
+                "tkinter 테스트를 진행합니다..."
             )
-            print(error_msg)
+            print(warning_msg)
+            # logging은 전역에서 import되었으므로 직접 사용
+            import logging as log_module
             try:
-                import tkinter.messagebox as msgbox
-                root_err = tk.Tk()
-                root_err.withdraw()
-                msgbox.showerror("Python 버전 문제", error_msg)
-                root_err.destroy()
+                log_module.warning(warning_msg)
             except:
-                pass
-            raise RuntimeError("Python 3.13에서는 tkinter가 작동하지 않습니다. Python 3.11 또는 3.12를 사용하세요.")
+                pass  # logging 오류는 무시
         
         # Tcl/Tk 경로 설정 (한글 경로 문제 해결)
         
@@ -107,11 +106,15 @@ def main():
         # (tkinter가 작동하는 경우 경로 설정 없이도 작동할 수 있음)
         if not tcl_found or not tk_found:
             import logging
-            logging.warning(f"Tcl/Tk 경로를 찾을 수 없습니다. Tcl: {tcl_found}, Tk: {tk_found}")
-            logging.warning(f"Python 경로: {python_dir}")
-            logging.warning(f"Python Lib 경로: {python_lib}")
-            logging.warning(f"Python prefix: {sys.prefix}")
-            logging.warning("경고: Tcl/Tk 경로를 찾지 못했지만 tkinter가 작동할 수 있습니다. 계속 진행합니다...")
+            try:
+                import logging as log_module
+                log_module.warning(f"Tcl/Tk 경로를 찾을 수 없습니다. Tcl: {tcl_found}, Tk: {tk_found}")
+                log_module.warning(f"Python 경로: {python_dir}")
+                log_module.warning(f"Python Lib 경로: {python_lib}")
+                log_module.warning(f"Python prefix: {sys.prefix}")
+                log_module.warning("경고: Tcl/Tk 경로를 찾지 못했지만 tkinter가 작동할 수 있습니다. 계속 진행합니다...")
+            except:
+                pass  # logging 오류는 무시
             
             # tkinter가 실제로 작동하는지 테스트
             try:
@@ -119,7 +122,11 @@ def main():
                 test_root = tkinter.Tk()
                 test_root.withdraw()
                 test_root.destroy()
-                logging.info("tkinter 테스트 성공 - 경로 설정 없이도 작동합니다.")
+                try:
+                    import logging as log_module
+                    log_module.info("tkinter 테스트 성공 - 경로 설정 없이도 작동합니다.")
+                except:
+                    pass  # logging 오류는 무시
             except Exception as e:
                 # tkinter가 작동하지 않는 경우에만 오류 발생
                 error_msg = (
@@ -144,17 +151,18 @@ def main():
                 raise RuntimeError(f"tkinter가 작동하지 않습니다: {e}")
         
         # 콘솔 창 숨기기 (GUI만 표시)
-        if sys.platform == 'win32':
-            try:
-                import ctypes
-                # 콘솔 창 숨기기
-                kernel32 = ctypes.windll.kernel32
-                user32 = ctypes.windll.user32
-                hwnd = kernel32.GetConsoleWindow()
-                if hwnd:
-                    user32.ShowWindow(hwnd, 0)  # 0 = 숨기기, 1 = 보이기
-            except:
-                pass
+        # 배치 파일에서 실행할 때는 콘솔을 유지하여 오류 메시지 확인 가능
+        # if sys.platform == 'win32':
+        #     try:
+        #         import ctypes
+        #         # 콘솔 창 숨기기
+        #         kernel32 = ctypes.windll.kernel32
+        #         user32 = ctypes.windll.user32
+        #         hwnd = kernel32.GetConsoleWindow()
+        #         if hwnd:
+        #             user32.ShowWindow(hwnd, 0)  # 0 = 숨기기, 1 = 보이기
+        #     except:
+        #         pass
         
         root = tk.Tk()
         

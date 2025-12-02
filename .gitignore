@@ -61,3 +61,6 @@ chromedriver
 *.tmp
 *.bak
 
+# 가상환경 스크립트 (프로젝트 루트에 있는 경우)
+Scripts/
+

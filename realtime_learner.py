@@ -44,7 +44,7 @@ class RealtimeLearner:
             import re
             
             scraper.driver.get(post_url)
-            time.sleep(3)  # 페이지 로딩 대기 시간 증가
+            time.sleep(5)  # 페이지 로딩 대기 시간 증가
             
             # 페이지가 완전히 로드될 때까지 대기
             try:
@@ -54,10 +54,61 @@ class RealtimeLearner:
                 WebDriverWait(scraper.driver, 10).until(
                     EC.presence_of_element_located((By.TAG_NAME, "body"))
                 )
+                
+                # 댓글 섹션이 로드될 때까지 추가 대기 (더 다양한 선택자 시도)
+                try:
+                    # 여러 패턴으로 댓글 섹션 찾기
+                    wait = WebDriverWait(scraper.driver, 8)
+                    wait.until(
+                        lambda driver: driver.find_elements(By.CSS_SELECTOR, "section#bo_vc") or 
+                                       driver.find_elements(By.CSS_SELECTOR, "article[id^='c_']") or
+                                       driver.find_elements(By.CSS_SELECTOR, "textarea[id^='save_comment_']")
+                    )
+                    logger.debug("댓글 섹션 로드 완료")
+                except:
+                    logger.debug("댓글 섹션 로드 대기 시간 초과 (계속 진행)")
+                    time.sleep(3)  # 추가 대기 시간 증가
             except:
                 pass
             
-            soup = BeautifulSoup(scraper.driver.page_source, 'html.parser')
+            # 스크롤하여 댓글이 동적으로 로드되도록 함 (더 적극적으로)
+            try:
+                # 댓글 섹션으로 스크롤
+                bo_vc_element = scraper.driver.find_elements(By.CSS_SELECTOR, "section#bo_vc")
+                if bo_vc_element:
+                    scraper.driver.execute_script("arguments[0].scrollIntoView(true);", bo_vc_element[0])
+                    time.sleep(2)
+                
+                # 페이지 끝까지 스크롤 (동적 로딩 트리거)
+                scraper.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(3)  # 대기 시간 증가
+                
+                # 다시 위로 스크롤
+                scraper.driver.execute_script("window.scrollTo(0, 0);")
+                time.sleep(1)
+                
+                # 댓글 섹션으로 다시 스크롤
+                if bo_vc_element:
+                    scraper.driver.execute_script("arguments[0].scrollIntoView(true);", bo_vc_element[0])
+                    time.sleep(2)
+            except:
+                pass
+            
+            # 페이지 소스를 여러 번 시도하여 동적 로딩 대응
+            soup = None
+            for attempt in range(3):
+                soup = BeautifulSoup(scraper.driver.page_source, 'html.parser')
+                bo_vc = soup.find('section', id='bo_vc')
+                if bo_vc:
+                    articles = bo_vc.find_all('article', id=lambda x: x and x.startswith('c_'))
+                    if articles:
+                        logger.info(f"댓글 article {len(articles)}개 발견 (시도 {attempt+1})")
+                        break
+                if attempt < 2:
+                    time.sleep(2)
+                    scraper.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(1)
+            
             comments = []
             
             # 온카판 실제 댓글 구조에 맞는 선택자
@@ -65,53 +116,167 @@ class RealtimeLearner:
             # 댓글 내용은 <div class="cmt_contents"> 안의 <p> 태그에 있음
             # 또는 <textarea id="save_comment_숫자"> 에도 저장되어 있음
             
-            # 방법 1: article 태그에서 댓글 찾기 (가장 정확)
-            comment_articles = soup.find_all('article', id=lambda x: x and x.startswith('c_'))
+            # 디버깅: 페이지 구조 분석
+            all_articles = soup.find_all('article')
+            logger.info(f"전체 article 태그 개수: {len(all_articles)}")
+            if all_articles:
+                sample_ids = [a.get('id', 'no-id') for a in all_articles[:5]]
+                logger.info(f"article ID 샘플: {sample_ids}")
+            
+            # 방법 1: section#bo_vc 안의 article 태그에서 댓글 찾기 (우선)
+            bo_vc = soup.find('section', id='bo_vc')
+            if bo_vc:
+                comment_articles = bo_vc.find_all('article', id=lambda x: x and x.startswith('c_'))
+                logger.info(f"section#bo_vc 안에서 article {len(comment_articles)}개 발견")
+            else:
+                comment_articles = []
+            
+            # 방법 2: 전체 페이지에서 c_로 시작하는 article 찾기 (백업)
+            if not comment_articles:
+                comment_articles = soup.find_all('article', id=lambda x: x and x.startswith('c_'))
+                logger.info(f"전체 페이지에서 article {len(comment_articles)}개 발견")
+            
+            logger.info(f"최종 댓글 article 태그 {len(comment_articles)}개 발견")
             
             if comment_articles:
-                logger.debug(f"댓글 article 태그 {len(comment_articles)}개 발견")
-                for article in comment_articles:
-                    # cmt_contents 클래스 안의 p 태그 찾기
-                    cmt_contents = article.find('div', class_='cmt_contents')
-                    if cmt_contents:
-                        p_tag = cmt_contents.find('p')
-                        if p_tag:
-                            content = p_tag.get_text(strip=True)
-                            if content and 3 < len(content) < 200:
-                                # "(수정됨 ...)" 같은 텍스트 제거
-                                if '(수정됨' in content:
-                                    content = content.split('(수정됨')[0].strip()
-                                if content and content not in comments:
-                                    comments.append(content)
+                logger.info(f"댓글 article 처리 시작: {len(comment_articles)}개")
+                for idx, article in enumerate(comment_articles):
+                    article_id = article.get('id', 'unknown')
+                    logger.debug(f"처리 중: article[{idx}] id={article_id}")
+                    comment_found = False
                     
-                    # 방법 2: textarea에서도 찾기 (백업)
+                    # 방법 1-1: textarea에서 찾기 (가장 정확함 - 우선 사용)
                     textarea = article.find('textarea', id=lambda x: x and x.startswith('save_comment_'))
                     if textarea:
                         content = textarea.get_text(strip=True)
                         if content and 3 < len(content) < 200:
-                            if content not in comments:
+                            # "(수정됨 ...)" 같은 텍스트 제거
+                            if '(수정됨' in content:
+                                content = content.split('(수정됨')[0].strip()
+                            if content and content not in comments:
                                 comments.append(content)
+                                comment_found = True
+                                logger.info(f"✅ textarea에서 댓글 추출 [{idx}]: {content[:50]}")
+                    
+                    # 방법 1-2: cmt_contents 클래스 안의 p 태그 찾기 (백업)
+                    if not comment_found:
+                        cmt_contents = article.find('div', class_='cmt_contents')
+                        if cmt_contents:
+                            p_tag = cmt_contents.find('p')
+                            if p_tag:
+                                content = p_tag.get_text(strip=True)
+                                if content and 3 < len(content) < 200:
+                                    # "(수정됨 ...)" 같은 텍스트 제거
+                                    if '(수정됨' in content:
+                                        content = content.split('(수정됨')[0].strip()
+                                    if content and content not in comments:
+                                        comments.append(content)
+                                        comment_found = True
+                                        logger.info(f"✅ p 태그에서 댓글 추출 [{idx}]: {content[:50]}")
+                    
+                    # 방법 1-3: article 내의 모든 p 태그에서 찾기 (최후의 수단)
+                    if not comment_found:
+                        p_tags = article.find_all('p')
+                        for p in p_tags:
+                            content = p.get_text(strip=True)
+                            if content and 3 < len(content) < 200:
+                                # 키워드 필터링
+                                exclude_keywords = [
+                                    '게시글', '작성자', '조회수', '추천', '비추천', '목록', '이전', '다음',
+                                    '로그인', '회원가입', '검색', '메뉴', '네비게이션', '푸터', '헤더',
+                                    '공지사항', '베스트', '인기', '최신', '정렬', '페이지', '댓글쓰기',
+                                    '수정', '삭제', '신고', '답글', '대댓글', '더보기', '접기', '전체보기',
+                                    '수정됨', '작성일', '댓글', '개', '건', '님의', '댓글'
+                                ]
+                                if not any(keyword in content for keyword in exclude_keywords):
+                                    if content and content not in comments:
+                                        comments.append(content)
+                                        logger.info(f"✅ article p 태그에서 댓글 추출 [{idx}]: {content[:50]}")
+                                        break
+                    
+                    if not comment_found:
+                        logger.warning(f"⚠️ article[{idx}] id={article_id}에서 댓글을 찾지 못했습니다")
             
-            # 방법 3: section#bo_vc에서 직접 찾기
+            # 방법 2: section#bo_vc에서 직접 찾기 (백업)
             if not comments:
+                logger.info("article 태그에서 댓글을 찾지 못해 section#bo_vc에서 검색...")
                 bo_vc = soup.find('section', id='bo_vc')
                 if bo_vc:
-                    # 모든 p 태그에서 댓글 찾기
-                    p_tags = bo_vc.find_all('p')
-                    for p in p_tags:
-                        content = p.get_text(strip=True)
-                        # 댓글처럼 보이는 텍스트만 (너무 짧거나 길지 않고, 특정 키워드 제외)
+                    logger.info(f"section#bo_vc 발견, 내부 구조 분석 중...")
+                    # section 내부의 모든 요소 확인
+                    all_textareas = bo_vc.find_all('textarea')
+                    all_divs = bo_vc.find_all('div', class_='cmt_contents')
+                    logger.info(f"section 내부 - textarea: {len(all_textareas)}개, cmt_contents div: {len(all_divs)}개")
+                    
+                    # 방법 2-1: 모든 textarea에서 찾기 (가장 정확) - ID 패턴 확장
+                    textareas = bo_vc.find_all('textarea', id=lambda x: x and ('save_comment_' in str(x) or 'comment' in str(x).lower()))
+                    if not textareas:
+                        # ID 조건 없이 모든 textarea 확인
+                        textareas = bo_vc.find_all('textarea')
+                    
+                    for textarea in textareas:
+                        content = textarea.get_text(strip=True)
                         if content and 3 < len(content) < 200:
-                            exclude_keywords = [
-                                '게시글', '작성자', '조회수', '추천', '비추천', '목록', '이전', '다음',
-                                '로그인', '회원가입', '검색', '메뉴', '네비게이션', '푸터', '헤더',
-                                '공지사항', '베스트', '인기', '최신', '정렬', '페이지', '댓글쓰기',
-                                '수정', '삭제', '신고', '답글', '대댓글', '더보기', '접기', '전체보기',
-                                '수정됨', '작성일', '댓글', '개', '건'
-                            ]
-                            if not any(keyword in content for keyword in exclude_keywords):
-                                if content not in comments:
-                                    comments.append(content)
+                            if '(수정됨' in content:
+                                content = content.split('(수정됨')[0].strip()
+                            if content and content not in comments:
+                                comments.append(content)
+                                logger.debug(f"section textarea에서 댓글 추출: {content[:30]}...")
+                    
+                    # 방법 2-2: cmt_contents div에서 찾기
+                    if not comments:
+                        for div in all_divs:
+                            # div 내부의 p 태그 찾기
+                            p_tag = div.find('p')
+                            if p_tag:
+                                content = p_tag.get_text(strip=True)
+                                if content and 3 < len(content) < 200:
+                                    if '(수정됨' in content:
+                                        content = content.split('(수정됨')[0].strip()
+                                    if content and content not in comments:
+                                        comments.append(content)
+                                        logger.debug(f"section cmt_contents에서 댓글 추출: {content[:30]}...")
+                            else:
+                                # p 태그가 없으면 div 자체의 텍스트
+                                content = div.get_text(strip=True)
+                                if content and 3 < len(content) < 200:
+                                    if '(수정됨' in content:
+                                        content = content.split('(수정됨')[0].strip()
+                                    if content and content not in comments:
+                                        comments.append(content)
+                                        logger.debug(f"section cmt_contents div 텍스트에서 댓글 추출: {content[:30]}...")
+                    
+                    # 방법 2-3: p 태그에서 찾기 (더 넓은 범위)
+                    if not comments:
+                        p_tags = bo_vc.find_all('p')
+                        for p in p_tags:
+                            content = p.get_text(strip=True)
+                            # 댓글처럼 보이는 텍스트만 (너무 짧거나 길지 않고, 특정 키워드 제외)
+                            if content and 3 < len(content) < 200:
+                                exclude_keywords = [
+                                    '게시글', '작성자', '조회수', '추천', '비추천', '목록', '이전', '다음',
+                                    '로그인', '회원가입', '검색', '메뉴', '네비게이션', '푸터', '헤더',
+                                    '공지사항', '베스트', '인기', '최신', '정렬', '페이지', '댓글쓰기',
+                                    '수정', '삭제', '신고', '답글', '대댓글', '더보기', '접기', '전체보기',
+                                    '수정됨', '작성일', '댓글', '개', '건', '님의'
+                                ]
+                                if not any(keyword in content for keyword in exclude_keywords):
+                                    if content not in comments:
+                                        comments.append(content)
+                                        logger.debug(f"section p 태그에서 댓글 추출: {content[:30]}...")
+            
+            # 방법 3: 페이지 전체에서 textarea 찾기 (최후의 수단)
+            if not comments:
+                logger.info("section에서도 댓글을 찾지 못해 페이지 전체에서 textarea 검색...")
+                all_textareas = soup.find_all('textarea', id=lambda x: x and 'comment' in str(x).lower())
+                for textarea in all_textareas:
+                    content = textarea.get_text(strip=True)
+                    if content and 3 < len(content) < 200:
+                        if '(수정됨' in content:
+                            content = content.split('(수정됨')[0].strip()
+                        if content and content not in comments:
+                            comments.append(content)
+                            logger.debug(f"전체 페이지 textarea에서 댓글 추출: {content[:30]}...")
             
             
             # 중복 제거 및 정리
@@ -126,15 +291,46 @@ class RealtimeLearner:
             
             logger.info(f"게시글에서 {len(unique_comments)}개의 댓글 수집: {post_url[:50]}...")
             
-            # 디버깅: 댓글을 찾지 못한 경우 페이지 소스 저장
+            # 디버깅: 댓글을 찾지 못한 경우 상세 로그
             if len(unique_comments) == 0:
+                logger.warning(f"댓글을 찾지 못했습니다. 디버깅 정보:")
+                logger.warning(f"  - article 태그 개수: {len(comment_articles) if 'comment_articles' in locals() else 0}")
+                logger.warning(f"  - section#bo_vc 존재: {bool(soup.find('section', id='bo_vc'))}")
+                
+                # 더 상세한 디버깅
+                bo_vc = soup.find('section', id='bo_vc')
+                if bo_vc:
+                    # section 내부의 모든 textarea 확인
+                    textareas = bo_vc.find_all('textarea')
+                    logger.warning(f"  - section 내부 textarea 개수: {len(textareas)}")
+                    if textareas:
+                        for i, ta in enumerate(textareas[:3]):  # 처음 3개만
+                            ta_id = ta.get('id', 'no-id')
+                            ta_text = ta.get_text(strip=True)[:50]
+                            logger.warning(f"    textarea[{i}] id={ta_id}, text={ta_text}...")
+                    
+                    # section 내부의 모든 div.cmt_contents 확인
+                    cmt_divs = bo_vc.find_all('div', class_='cmt_contents')
+                    logger.warning(f"  - section 내부 cmt_contents div 개수: {len(cmt_divs)}")
+                    if cmt_divs:
+                        for i, div in enumerate(cmt_divs[:3]):  # 처음 3개만
+                            div_text = div.get_text(strip=True)[:50]
+                            logger.warning(f"    cmt_contents[{i}] text={div_text}...")
+                
+                # 페이지 소스 일부 저장 (댓글 섹션만)
                 try:
-                    debug_file = f"debug_page_source_{int(time.time())}.html"
-                    with open(debug_file, 'w', encoding='utf-8') as f:
-                        f.write(scraper.driver.page_source)
-                    logger.debug(f"댓글을 찾지 못해 페이지 소스를 {debug_file}에 저장했습니다.")
-                except:
-                    pass
+                    if bo_vc:
+                        debug_file = f"debug_comment_section_{int(time.time())}.html"
+                        with open(debug_file, 'w', encoding='utf-8') as f:
+                            f.write(str(bo_vc))
+                        logger.warning(f"댓글 섹션 HTML을 {debug_file}에 저장했습니다.")
+                    else:
+                        debug_file = f"debug_page_source_{int(time.time())}.html"
+                        with open(debug_file, 'w', encoding='utf-8') as f:
+                            f.write(scraper.driver.page_source)
+                        logger.warning(f"댓글 섹션을 찾지 못해 전체 페이지 소스를 {debug_file}에 저장했습니다.")
+                except Exception as e:
+                    logger.error(f"디버그 파일 저장 오류: {e}")
             
             return unique_comments
             

@@ -8,14 +8,25 @@ from tkinter import ttk, messagebox, scrolledtext
 import threading
 from functools import partial
 from config_manager import ConfigManager
-from web_scraper import OncaPanScraper
-from ai_comment_generator import AICommentGenerator
 import time
 import random
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Cloudflare 우회를 위해 Selenium 사용
+try:
+    from web_scraper_selenium import OncaPanScraperSelenium as OncaPanScraper
+    USE_SELENIUM = True
+    logger.info("Selenium 모드로 실행됩니다 (Cloudflare 우회)")
+except ImportError as e:
+    logger.warning(f"Selenium을 사용할 수 없습니다: {e}")
+    logger.warning("requests 모드로 전환합니다 (Cloudflare 차단 가능)")
+    from web_scraper import OncaPanScraper
+    USE_SELENIUM = False
+
+from ai_comment_generator import AICommentGenerator
 
 class MacroGUI:
     def __init__(self, root):
@@ -305,6 +316,64 @@ class MacroGUI:
                                 continue
                             
                             post_content = post_data.get('content', '')
+                            # 실제 페이지에서 추출한 제목 사용 (없으면 목록에서 가져온 제목 사용)
+                            actual_post_title = post_data.get('title', '') or post.get('title', '')
+                            
+                            # 게시글 정보 로그 출력
+                            self.root.after(0, partial(self.log, "=" * 60))
+                            self.root.after(0, partial(self.log, f"📄 게시글 제목: {actual_post_title}"))
+                            self.root.after(0, partial(self.log, "📝 게시글 본문:"))
+                            if post_content:
+                                # 본문이 너무 길면 일부만 표시
+                                content_preview = post_content[:300] if len(post_content) > 300 else post_content
+                                self.root.after(0, partial(self.log, f"   {content_preview}"))
+                                if len(post_content) > 300:
+                                    self.root.after(0, partial(self.log, f"   ... (전체 {len(post_content)}자 중 300자만 표시)"))
+                            else:
+                                self.root.after(0, partial(self.log, "   (본문 없음)"))
+                            self.root.after(0, partial(self.log, "=" * 60))
+                            
+                            # 실시간 학습: 게시글에서 댓글 수집 (gui.py도 댓글 수집 추가)
+                            try:
+                                from realtime_learner import RealtimeLearner
+                                learner = RealtimeLearner()
+                                self.root.after(0, partial(self.log, "📖 게시글의 실제 댓글 수집 중..."))
+                                actual_comments = learner.collect_comments_from_post(self.scraper, post_url)
+                                
+                                if actual_comments:
+                                    self.root.after(0, partial(self.log, f"✅ {len(actual_comments)}개의 실제 댓글을 수집했습니다."))
+                                    self.root.after(0, partial(self.log, "📋 수집된 댓글 목록:"))
+                                    for idx, comment in enumerate(actual_comments, 1):
+                                        comment_preview = comment[:100] if len(comment) > 100 else comment
+                                        if len(comment) > 100:
+                                            comment_preview += "..."
+                                        self.root.after(0, partial(self.log, f"   {idx}. {comment_preview}"))
+                                else:
+                                    self.root.after(0, partial(self.log, "⚠️ 이 게시글에는 댓글이 없습니다."))
+                                    actual_comments = []
+                            except Exception as e:
+                                # 실시간 학습 실패 시 빈 리스트 사용
+                                actual_comments = []
+                                self.root.after(0, partial(self.log, f"⚠️ 댓글 수집 실패: {str(e)}"))
+                            
+                            # 디버그 로그에 게시글 정보 기록
+                            try:
+                                import datetime
+                                debug_log_file = "ai_debug_log.txt"
+                                with open(debug_log_file, 'a', encoding='utf-8') as f:
+                                    f.write("\n" + "="*80 + "\n")
+                                    f.write(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 게시글 정보\n")
+                                    f.write("="*80 + "\n\n")
+                                    f.write("【게시글 제목】\n")
+                                    f.write(f"{actual_post_title if actual_post_title else '(제목 없음)'}\n\n")
+                                    f.write("【게시글 본문】\n")
+                                    content_preview = post_content[:500] if post_content else "(본문 없음)"
+                                    f.write(f"{content_preview}")
+                                    if post_content and len(post_content) > 500:
+                                        f.write(f"\n... (전체 {len(post_content)}자 중 500자만 표시)")
+                                    f.write("\n\n")
+                            except Exception as e:
+                                pass
                             
                             # 댓글 생성 가능 여부 확인
                             if not self.ai_generator.can_generate_comment(post_content):
@@ -317,11 +386,18 @@ class MacroGUI:
                             time.sleep(wait_time)
                             
                             # AI 댓글 생성
-                            self.root.after(0, partial(self.log, "AI 댓글 생성 중..."))
-                            comment = self.ai_generator.generate_comment(post_content, post.get('title', ''))
+                            if actual_comments:
+                                self.root.after(0, partial(self.log, "🤖 AI 댓글 생성 중... (게시글의 실제 댓글을 참고하여 생성)"))
+                            else:
+                                self.root.after(0, partial(self.log, "🤖 AI 댓글 생성 중..."))
+                            # 실제 댓글 목록을 AI에 전달
+                            comment = self.ai_generator.generate_comment(post_content, actual_post_title, actual_comments)
                             
                             if not comment:
-                                self.root.after(0, partial(self.log, "댓글 생성 실패. 건너뜁니다."))
+                                if not actual_comments or len(actual_comments) == 0:
+                                    self.root.after(0, partial(self.log, "⚠️ 이 게시글에는 댓글이 없어서 건너뜁니다."))
+                                else:
+                                    self.root.after(0, partial(self.log, "⚠️ 댓글 생성 실패. 건너뜁니다."))
                                 continue
                             
                             # 댓글 작성

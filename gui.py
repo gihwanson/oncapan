@@ -29,12 +29,16 @@ except ImportError as e:
 from ai_comment_generator import AICommentGenerator
 
 class MacroGUI:
-    def __init__(self, root):
+    def __init__(self, root, force_test_mode=False):
         self.root = root
-        self.root.title("온카판 자동 댓글 매크로")
+        if force_test_mode:
+            self.root.title("온카판 자동 댓글 매크로 (테스트 모드)")
+        else:
+            self.root.title("온카판 자동 댓글 매크로")
         self.root.geometry("600x700")
         self.root.resizable(False, False)
         
+        self.force_test_mode = force_test_mode
         self.config_manager = ConfigManager()
         self.scraper = None
         self.ai_generator = None
@@ -80,22 +84,29 @@ class MacroGUI:
         self.delay_entry.grid(row=0, column=1, pady=2, padx=5, sticky=tk.W)
         
         ttk.Label(delay_frame, text="최소 대기 시간 (초):").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self.min_delay_entry = ttk.Entry(delay_frame, width=10)
-        self.min_delay_entry.insert(0, "5")
+        self.min_delay_entry = ttk.Entry(delay_frame, width=10, state='readonly')
+        self.min_delay_entry.insert(0, "3")
         self.min_delay_entry.grid(row=1, column=1, pady=2, padx=5, sticky=tk.W)
         
         ttk.Label(delay_frame, text="최대 대기 시간 (초):").grid(row=2, column=0, sticky=tk.W, pady=2)
-        self.max_delay_entry = ttk.Entry(delay_frame, width=10)
-        self.max_delay_entry.insert(0, "15")
+        self.max_delay_entry = ttk.Entry(delay_frame, width=10, state='readonly')
+        self.max_delay_entry.insert(0, "5")
         self.max_delay_entry.grid(row=2, column=1, pady=2, padx=5, sticky=tk.W)
         
         # 테스트 모드 체크박스
         test_frame = ttk.Frame(main_frame)
         test_frame.grid(row=3, column=0, columnspan=2, pady=5)
         
-        self.test_mode_var = tk.BooleanVar(value=False)
+        self.test_mode_var = tk.BooleanVar(value=self.force_test_mode)
         test_check = ttk.Checkbutton(test_frame, text="테스트 모드 (실제 댓글 작성 안 함)", variable=self.test_mode_var)
         test_check.pack()
+        
+        # 테스트 모드 강제 활성화인 경우 체크박스 비활성화
+        if self.force_test_mode:
+            test_check.config(state=tk.DISABLED)
+            # 테스트 모드 안내 라벨 추가
+            test_label = ttk.Label(test_frame, text="⚠️ 테스트 모드로만 실행됩니다", foreground="orange")
+            test_label.pack(pady=(5, 0))
         
         # 버튼 프레임
         button_frame = ttk.Frame(main_frame)
@@ -144,10 +155,15 @@ class MacroGUI:
             self.api_key_entry.insert(0, config.get('api_key', ''))
             self.delay_entry.delete(0, tk.END)
             self.delay_entry.insert(0, str(config.get('comment_delay', 10)))
+            # 최소/최대 대기 시간은 고정값 사용 (3초, 5초)
+            self.min_delay_entry.config(state='normal')
             self.min_delay_entry.delete(0, tk.END)
-            self.min_delay_entry.insert(0, str(config.get('min_delay', 5)))
+            self.min_delay_entry.insert(0, "3")
+            self.min_delay_entry.config(state='readonly')
+            self.max_delay_entry.config(state='normal')
             self.max_delay_entry.delete(0, tk.END)
-            self.max_delay_entry.insert(0, str(config.get('max_delay', 15)))
+            self.max_delay_entry.insert(0, "5")
+            self.max_delay_entry.config(state='readonly')
             self.log("저장된 설정을 불러왔습니다.")
     
     def save_config(self):
@@ -162,12 +178,9 @@ class MacroGUI:
         
         try:
             delay = int(self.delay_entry.get())
-            min_delay = int(self.min_delay_entry.get())
-            max_delay = int(self.max_delay_entry.get())
-            
-            if min_delay >= max_delay:
-                messagebox.showwarning("경고", "최소 대기 시간은 최대 대기 시간보다 작아야 합니다.")
-                return
+            # 최소/최대 대기 시간은 고정값 사용 (3초, 5초)
+            min_delay = 3
+            max_delay = 5
             
         except ValueError:
             messagebox.showerror("오류", "대기 시간은 숫자로 입력해주세요.")
@@ -189,8 +202,9 @@ class MacroGUI:
         
         try:
             delay = int(self.delay_entry.get())
-            min_delay = int(self.min_delay_entry.get())
-            max_delay = int(self.max_delay_entry.get())
+            # 최소/최대 대기 시간은 고정값 사용 (3초, 5초)
+            min_delay = 3
+            max_delay = 5
         except ValueError:
             messagebox.showerror("오류", "대기 시간은 숫자로 입력해주세요.")
             return
@@ -204,8 +218,9 @@ class MacroGUI:
         self.password_entry.config(state=tk.DISABLED)
         self.api_key_entry.config(state=tk.DISABLED)
         self.delay_entry.config(state=tk.DISABLED)
-        self.min_delay_entry.config(state=tk.DISABLED)
-        self.max_delay_entry.config(state=tk.DISABLED)
+        # 최소/최대 대기 시간은 readonly 상태 유지
+        self.min_delay_entry.config(state='readonly')
+        self.max_delay_entry.config(state='readonly')
         
         # 워커 스레드 시작
         self.worker_thread = threading.Thread(
@@ -229,8 +244,9 @@ class MacroGUI:
         self.password_entry.config(state=tk.NORMAL)
         self.api_key_entry.config(state=tk.NORMAL)
         self.delay_entry.config(state=tk.NORMAL)
-        self.min_delay_entry.config(state=tk.NORMAL)
-        self.max_delay_entry.config(state=tk.NORMAL)
+        # 최소/최대 대기 시간은 readonly 상태 유지
+        self.min_delay_entry.config(state='readonly')
+        self.max_delay_entry.config(state='readonly')
         
         if self.scraper:
             self.scraper.close()
@@ -277,11 +293,9 @@ class MacroGUI:
                 while self.is_running:
                     try:
                         # 게시글 목록 가져오기
-                        self.root.after(0, lambda: self.log("게시글 목록을 가져오는 중..."))
                         posts = self.scraper.get_post_list(limit=20)
                         
                         if not posts:
-                            self.root.after(0, lambda: self.log("게시글을 찾을 수 없습니다. 잠시 후 재시도..."))
                             time.sleep(30)
                             continue
                         
@@ -303,13 +317,30 @@ class MacroGUI:
                             # 이미 댓글을 달았는지 확인
                             if self.scraper.has_commented(post_url, username):
                                 commented_posts.add(post_id)
-                                post_title = post.get('title', '')[:30]
-                                self.root.after(0, partial(self.log, f"이미 댓글을 단 게시글: {post_title}"))
                                 continue
+                            
+                            # 24시간 이내 게시글인지 확인 (추가 검증)
+                            post_datetime_str = post.get('datetime')
+                            if post_datetime_str:
+                                from datetime import datetime, timedelta
+                                try:
+                                    # 날짜 파싱 (간단한 검증)
+                                    now = datetime.now()
+                                    if '-' in post_datetime_str:
+                                        # 날짜 형식 - 추가 검증
+                                        parts = post_datetime_str.split('-')
+                                        if len(parts) == 2:
+                                            month, day = int(parts[0]), int(parts[1])
+                                            post_date = now.replace(month=month, day=day, hour=0, minute=0, second=0, microsecond=0)
+                                            if post_date > now:
+                                                post_date = post_date.replace(year=now.year - 1)
+                                            if now - post_date > timedelta(hours=24):
+                                                continue
+                                except:
+                                    pass  # 날짜 파싱 실패 시 계속 진행
                             
                             # 게시글 내용 가져오기
                             post_title = post.get('title', '')[:30]
-                            self.root.after(0, partial(self.log, f"게시글 처리 중: {post_title}"))
                             post_data = self.scraper.get_post_content(post_url)
                             
                             if not post_data:
@@ -319,42 +350,44 @@ class MacroGUI:
                             # 실제 페이지에서 추출한 제목 사용 (없으면 목록에서 가져온 제목 사용)
                             actual_post_title = post_data.get('title', '') or post.get('title', '')
                             
-                            # 게시글 정보 로그 출력
-                            self.root.after(0, partial(self.log, "=" * 60))
-                            self.root.after(0, partial(self.log, f"📄 게시글 제목: {actual_post_title}"))
-                            self.root.after(0, partial(self.log, "📝 게시글 본문:"))
-                            if post_content:
-                                # 본문이 너무 길면 일부만 표시
-                                content_preview = post_content[:300] if len(post_content) > 300 else post_content
-                                self.root.after(0, partial(self.log, f"   {content_preview}"))
-                                if len(post_content) > 300:
-                                    self.root.after(0, partial(self.log, f"   ... (전체 {len(post_content)}자 중 300자만 표시)"))
-                            else:
-                                self.root.after(0, partial(self.log, "   (본문 없음)"))
-                            self.root.after(0, partial(self.log, "=" * 60))
+                            # 1. 게시물 제목 (전체)
+                            self.root.after(0, partial(self.log, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
+                            self.root.after(0, partial(self.log, f"📄 【게시물 제목】"))
+                            self.root.after(0, partial(self.log, f"{actual_post_title if actual_post_title else '(제목 없음)'}"))
                             
-                            # 실시간 학습: 게시글에서 댓글 수집 (gui.py도 댓글 수집 추가)
+                            # 2. 게시물 본문 (전체)
+                            self.root.after(0, partial(self.log, f""))
+                            self.root.after(0, partial(self.log, f"📝 【게시물 본문】"))
+                            if post_content:
+                                # 본문이 길 경우 여러 줄로 나누어 표시
+                                content_lines = post_content.split('\n')
+                                for line in content_lines:
+                                    if line.strip():
+                                        self.root.after(0, partial(self.log, f"{line}"))
+                            else:
+                                self.root.after(0, partial(self.log, f"(본문 없음)"))
+                            
+                            # 실시간 학습: 게시글에서 댓글 수집
                             try:
                                 from realtime_learner import RealtimeLearner
                                 learner = RealtimeLearner()
-                                self.root.after(0, partial(self.log, "📖 게시글의 실제 댓글 수집 중..."))
                                 actual_comments = learner.collect_comments_from_post(self.scraper, post_url)
                                 
+                                # 3. 댓글들 (전체 목록)
+                                self.root.after(0, partial(self.log, f""))
+                                self.root.after(0, partial(self.log, f"💬 【댓글 목록】 (총 {len(actual_comments) if actual_comments else 0}개)"))
                                 if actual_comments:
-                                    self.root.after(0, partial(self.log, f"✅ {len(actual_comments)}개의 실제 댓글을 수집했습니다."))
-                                    self.root.after(0, partial(self.log, "📋 수집된 댓글 목록:"))
-                                    for idx, comment in enumerate(actual_comments, 1):
-                                        comment_preview = comment[:100] if len(comment) > 100 else comment
-                                        if len(comment) > 100:
-                                            comment_preview += "..."
-                                        self.root.after(0, partial(self.log, f"   {idx}. {comment_preview}"))
+                                    for i, comment in enumerate(actual_comments, 1):
+                                        comment_text = comment if isinstance(comment, str) else comment.get('content', str(comment))
+                                        self.root.after(0, partial(self.log, f"  {i}. {comment_text}"))
                                 else:
-                                    self.root.after(0, partial(self.log, "⚠️ 이 게시글에는 댓글이 없습니다."))
                                     actual_comments = []
+                                    self.root.after(0, partial(self.log, f"  (댓글 없음)"))
                             except Exception as e:
                                 # 실시간 학습 실패 시 빈 리스트 사용
                                 actual_comments = []
-                                self.root.after(0, partial(self.log, f"⚠️ 댓글 수집 실패: {str(e)}"))
+                                self.root.after(0, partial(self.log, f""))
+                                self.root.after(0, partial(self.log, f"💬 【댓글 목록】 (수집 실패: {str(e)})"))
                             
                             # 디버그 로그에 게시글 정보 기록
                             try:
@@ -377,45 +410,46 @@ class MacroGUI:
                             
                             # 댓글 생성 가능 여부 확인
                             if not self.ai_generator.can_generate_comment(post_content):
-                                self.root.after(0, lambda: self.log("댓글 생성 불가능한 게시글입니다. 건너뜁니다."))
                                 continue
+                            
+                            # 3. 키워드 표시 (댓글 생성 전)
+                            if actual_comments:
+                                try:
+                                    keywords = self.ai_generator._extract_keywords(actual_comments)
+                                    if keywords:
+                                        self.root.after(0, partial(self.log, f"🔑 키워드: {', '.join(keywords[:3])}"))
+                                except:
+                                    pass
                             
                             # 설정된 대기 시간
                             wait_time = random.uniform(min_delay, max_delay)
-                            self.root.after(0, partial(self.log, f"{wait_time:.1f}초 대기 중..."))
                             time.sleep(wait_time)
                             
                             # AI 댓글 생성
-                            if actual_comments:
-                                self.root.after(0, partial(self.log, "🤖 AI 댓글 생성 중... (게시글의 실제 댓글을 참고하여 생성)"))
-                            else:
-                                self.root.after(0, partial(self.log, "🤖 AI 댓글 생성 중..."))
-                            # 실제 댓글 목록을 AI에 전달
                             comment = self.ai_generator.generate_comment(post_content, actual_post_title, actual_comments)
                             
                             if not comment:
-                                if not actual_comments or len(actual_comments) == 0:
-                                    self.root.after(0, partial(self.log, "⚠️ 이 게시글에는 댓글이 없어서 건너뜁니다."))
-                                else:
-                                    self.root.after(0, partial(self.log, "⚠️ 댓글 생성 실패. 건너뜁니다."))
                                 continue
                             
-                            # 댓글 작성
-                            comment_preview = comment[:30]
-                            self.root.after(0, partial(self.log, f"댓글 작성 중: {comment_preview}..."))
+                            # 4. AI가 작성한 댓글 (전체)
+                            self.root.after(0, partial(self.log, f""))
+                            self.root.after(0, partial(self.log, f"🤖 【AI가 작성한 댓글】"))
+                            self.root.after(0, partial(self.log, f"{comment}"))
+                            
                             if self.scraper.write_comment(post_url, comment):
                                 commented_posts.add(post_id)
-                                self.root.after(0, partial(self.log, "댓글 작성 완료!"))
+                                self.root.after(0, partial(self.log, f"✅ 댓글 작성 완료"))
                                 status_text = f"댓글 작성 완료: {len(commented_posts)}개"
                                 self.root.after(0, partial(self.status_label.config, text=status_text))
                             else:
-                                self.root.after(0, partial(self.log, "댓글 작성 실패."))
+                                self.root.after(0, partial(self.log, f"❌ 댓글 작성 실패"))
+                            
+                            self.root.after(0, partial(self.log, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
                             
                             # 게시글 간 대기 시간
                             time.sleep(delay)
                         
                         # 게시글 목록 새로고침 대기
-                        self.root.after(0, lambda: self.log("다음 게시글 목록을 기다리는 중..."))
                         time.sleep(60)  # 1분마다 게시글 목록 새로고침
                         
                     except Exception as e:

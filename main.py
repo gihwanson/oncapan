@@ -21,9 +21,18 @@ def main():
     import sys
     import os
     
-    # 오류 발생 시에도 콘솔에 출력되도록 설정
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    # 오류 발생 시에도 콘솔에 출력되도록 설정 (exe에서는 None일 수 있음)
+    try:
+        if sys.stdout is not None:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, OSError):
+        pass  # exe에서 콘솔이 없으면 무시
+    
+    try:
+        if sys.stderr is not None:
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, OSError):
+        pass  # exe에서 콘솔이 없으면 무시
     
     try:
         
@@ -50,57 +59,146 @@ def main():
         python_dir = os.path.dirname(os.path.abspath(python_exe))
         python_lib = os.path.join(python_dir, 'Lib')
         
-        # 가능한 Tcl/Tk 경로들
-        possible_tcl_paths = [
-            os.path.join(python_lib, 'tcl', 'tcl8.6'),
-            os.path.join(python_dir, 'tcl', 'tcl8.6'),
-            os.path.join(sys.prefix, 'Lib', 'tcl', 'tcl8.6'),
-            os.path.join(sys.prefix, 'tcl', 'tcl8.6'),
+        # Python 3.13+의 경우 sys.prefix가 잘못된 경로를 반환할 수 있으므로
+        # 여러 경로를 시도합니다
+        base_paths = [
+            python_dir,  # Python 실행 파일이 있는 디렉토리
+            python_lib,  # Lib 디렉토리
         ]
         
-        possible_tk_paths = [
-            os.path.join(python_lib, 'tk', 'tk8.6'),
-            os.path.join(python_dir, 'tcl', 'tk8.6'),
-            os.path.join(sys.prefix, 'Lib', 'tk', 'tk8.6'),
-            os.path.join(sys.prefix, 'tcl', 'tk8.6'),
-        ]
+        # sys.prefix가 유효한 경로인 경우에만 추가
+        if sys.prefix and os.path.exists(sys.prefix) and sys.prefix != python_dir:
+            base_paths.append(sys.prefix)
+            base_paths.append(os.path.join(sys.prefix, 'Lib'))
         
-        # Tcl 경로 찾기 및 설정
+        # Python 디렉토리의 부모도 시도
+        if python_dir:
+            parent_dir = os.path.dirname(python_dir)
+            if parent_dir and os.path.exists(parent_dir):
+                base_paths.append(parent_dir)
+        
+        # Windows에서 일반적인 Python 설치 경로들도 시도
+        import platform
+        if platform.system() == 'Windows':
+            user_home = os.path.expanduser('~')
+            common_paths = [
+                os.path.join(user_home, 'AppData', 'Local', 'Programs', 'Python', 'Python313'),
+                os.path.join(user_home, 'AppData', 'Local', 'Programs', 'Python'),
+                r'C:\Python313',
+                r'C:\Python\Python313',
+                r'C:\Program Files\Python313',
+                r'C:\Program Files (x86)\Python313',
+            ]
+            for common_path in common_paths:
+                if os.path.exists(common_path):
+                    base_paths.append(common_path)
+                    base_paths.append(os.path.join(common_path, 'Lib'))
+        
+        # None 제거 및 중복 제거
+        base_paths = list(dict.fromkeys([p for p in base_paths if p and os.path.exists(p)]))
+        
+        # 디버그 정보 출력
+        debug_info = []
+        debug_info.append(f"Python 실행 파일: {python_exe}")
+        debug_info.append(f"Python 디렉토리: {python_dir}")
+        debug_info.append(f"Python Lib: {python_lib}")
+        debug_info.append(f"sys.prefix: {sys.prefix}")
+        debug_info.append(f"시도할 base 경로 수: {len(base_paths)}")
+        
+        # 로깅에 디버그 정보 출력
+        try:
+            import logging as log_module
+            for info in debug_info:
+                log_module.debug(info)
+        except:
+            pass
+        
+        # Tcl 경로 찾기 및 설정 (여러 버전 시도)
         tcl_found = False
-        for tcl_path in possible_tcl_paths:
-            tcl_path = os.path.normpath(tcl_path)  # 경로 정규화
-            if os.path.exists(tcl_path) and os.path.isdir(tcl_path):
-                # init.tcl 파일이 있는지 확인
-                init_tcl = os.path.join(tcl_path, 'init.tcl')
-                if os.path.exists(init_tcl):
-                    os.environ['TCL_LIBRARY'] = tcl_path
-                    tcl_found = True
+        tcl_versions = ['tcl8.6', 'tcl8.7', 'tcl9.0', 'tcl']  # 여러 버전 시도
+        found_tcl_path = None
+        
+        for tcl_ver in tcl_versions:
+            if tcl_found:
+                break
+            for base_path in base_paths:
+                tcl_paths_to_try = [
+                    os.path.join(base_path, 'Lib', 'tcl', tcl_ver),
+                    os.path.join(base_path, 'tcl', tcl_ver),
+                    os.path.join(base_path, 'lib', tcl_ver),
+                    os.path.join(base_path, tcl_ver),
+                ]
+                for tcl_path in tcl_paths_to_try:
+                    try:
+                        tcl_path = os.path.normpath(tcl_path)
+                        if os.path.exists(tcl_path) and os.path.isdir(tcl_path):
+                            # init.tcl 파일이 있는지 확인
+                            init_tcl = os.path.join(tcl_path, 'init.tcl')
+                            if os.path.exists(init_tcl):
+                                # 환경 변수 설정 시도
+                                try:
+                                    os.environ['TCL_LIBRARY'] = tcl_path
+                                    found_tcl_path = tcl_path
+                                    tcl_found = True
+                                    try:
+                                        import logging as log_module
+                                        log_module.info(f"Tcl 경로 발견: {tcl_path}")
+                                    except:
+                                        pass
+                                    break
+                                except Exception as e:
+                                    try:
+                                        import logging as log_module
+                                        log_module.warning(f"Tcl 경로 설정 실패: {e}")
+                                    except:
+                                        pass
+                    except Exception as e:
+                        # 경로 접근 오류는 무시하고 계속
+                        continue
+                if tcl_found:
                     break
         
-        # Tk 경로 찾기 및 설정
+        # Tk 경로 찾기 및 설정 (여러 버전 시도)
         tk_found = False
-        for tk_path in possible_tk_paths:
-            tk_path = os.path.normpath(tk_path)  # 경로 정규화
-            if os.path.exists(tk_path) and os.path.isdir(tk_path):
-                os.environ['TK_LIBRARY'] = tk_path
-                tk_found = True
-                break
+        tk_versions = ['tk8.6', 'tk8.7', 'tk9.0', 'tk']  # 여러 버전 시도
+        found_tk_path = None
         
-        # 경로를 찾지 못한 경우 - 추가 시도
-        if not tcl_found or not tk_found:
-            # sys.prefix 직접 사용
-            prefix_tcl = os.path.normpath(os.path.join(sys.prefix, 'Lib', 'tcl', 'tcl8.6'))
-            prefix_tk = os.path.normpath(os.path.join(sys.prefix, 'Lib', 'tk', 'tk8.6'))
-            
-            if not tcl_found and os.path.exists(prefix_tcl):
-                init_tcl = os.path.join(prefix_tcl, 'init.tcl')
-                if os.path.exists(init_tcl):
-                    os.environ['TCL_LIBRARY'] = prefix_tcl
-                    tcl_found = True
-            
-            if not tk_found and os.path.exists(prefix_tk):
-                os.environ['TK_LIBRARY'] = prefix_tk
-                tk_found = True
+        for tk_ver in tk_versions:
+            if tk_found:
+                break
+            for base_path in base_paths:
+                tk_paths_to_try = [
+                    os.path.join(base_path, 'Lib', 'tk', tk_ver),
+                    os.path.join(base_path, 'tk', tk_ver),
+                    os.path.join(base_path, 'lib', tk_ver),
+                    os.path.join(base_path, tk_ver),
+                ]
+                for tk_path in tk_paths_to_try:
+                    try:
+                        tk_path = os.path.normpath(tk_path)
+                        if os.path.exists(tk_path) and os.path.isdir(tk_path):
+                            # 환경 변수 설정 시도
+                            try:
+                                os.environ['TK_LIBRARY'] = tk_path
+                                found_tk_path = tk_path
+                                tk_found = True
+                                try:
+                                    import logging as log_module
+                                    log_module.info(f"Tk 경로 발견: {tk_path}")
+                                except:
+                                    pass
+                                break
+                            except Exception as e:
+                                try:
+                                    import logging as log_module
+                                    log_module.warning(f"Tk 경로 설정 실패: {e}")
+                                except:
+                                    pass
+                    except Exception as e:
+                        # 경로 접근 오류는 무시하고 계속
+                        continue
+                if tk_found:
+                    break
         
         # 경로를 찾지 못한 경우 경고만 표시하고 계속 진행
         # (tkinter가 작동하는 경우 경로 설정 없이도 작동할 수 있음)
@@ -129,13 +227,32 @@ def main():
                     pass  # logging 오류는 무시
             except Exception as e:
                 # tkinter가 작동하지 않는 경우에만 오류 발생
+                # 시도한 경로 정보 수집
+                tried_paths_info = []
+                tried_paths_info.append(f"Python 실행 파일: {python_exe}")
+                tried_paths_info.append(f"Python 디렉토리: {python_dir}")
+                tried_paths_info.append(f"Python Lib: {python_lib}")
+                tried_paths_info.append(f"sys.prefix: {sys.prefix}")
+                if found_tcl_path:
+                    tried_paths_info.append(f"발견된 Tcl 경로: {found_tcl_path}")
+                if found_tk_path:
+                    tried_paths_info.append(f"발견된 Tk 경로: {found_tk_path}")
+                tried_paths_info.append(f"시도한 base 경로: {len(base_paths)}개")
+                
                 error_msg = (
                     "Tcl/Tk를 찾을 수 없고 tkinter도 작동하지 않습니다.\n\n"
-                    "Python 설치에 tkinter가 포함되지 않았습니다.\n\n"
+                    "Python 설치에 tkinter가 포함되지 않았거나 경로를 찾을 수 없습니다.\n\n"
+                    "디버그 정보:\n" + "\n".join(f"  - {info}" for info in tried_paths_info) + "\n\n"
                     "해결 방법:\n"
-                    "1. Python을 재설치하세요\n"
-                    "2. 설치 시 'tcl/tk and IDLE' 옵션을 반드시 선택하세요\n"
-                    "3. Python 3.11 또는 3.12 사용을 권장합니다"
+                    "1. Python을 재설치하세요 (Python 3.11 또는 3.12 권장)\n"
+                    "   - 다운로드: https://www.python.org/downloads/\n"
+                    "   - 설치 시 'tcl/tk and IDLE' 옵션을 반드시 선택하세요\n"
+                    "   - 'Add Python to PATH' 옵션도 체크하세요\n"
+                    "2. Python 3.13은 tkinter 문제가 있을 수 있으므로 3.11 또는 3.12 사용을 권장합니다\n"
+                    "3. Python 설치 경로에 한글이 포함되지 않도록 하세요\n"
+                    "   (예: C:\\Python312 같은 영문 경로 사용)\n"
+                    "4. 관리자 권한으로 Python을 설치해보세요\n"
+                    "5. 기존 Python을 완전히 제거한 후 재설치하세요"
                 )
                 
                 # GUI 오류 메시지 표시 시도
@@ -183,7 +300,7 @@ def main():
         root.deiconify()
         root.focus_force()
         
-        app = MacroGUI(root)
+        app = MacroGUI(root, force_test_mode=True)
         root.mainloop()
     except Exception as e:
         import traceback

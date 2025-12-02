@@ -43,22 +43,27 @@ class RealtimeLearner:
             import time
             import re
             
-            scraper.driver.get(post_url)
-            time.sleep(5)  # 페이지 로딩 대기 시간 증가
+            # 현재 URL 확인 - 이미 해당 게시글 페이지에 있으면 새로고침 안 함
+            current_url = scraper.driver.current_url
+            if post_url not in current_url and current_url not in post_url:
+                scraper.driver.get(post_url)
+                time.sleep(1)  # 최소 대기 시간으로 줄임
+            else:
+                time.sleep(0.3)  # 이미 해당 페이지에 있으면 짧은 대기만
             
-            # 페이지가 완전히 로드될 때까지 대기
+            # 페이지가 완전히 로드될 때까지 대기 (타임아웃 줄임)
             try:
                 from selenium.webdriver.support.ui import WebDriverWait
                 from selenium.webdriver.support import expected_conditions as EC
                 from selenium.webdriver.common.by import By
-                WebDriverWait(scraper.driver, 10).until(
+                WebDriverWait(scraper.driver, 3).until(
                     EC.presence_of_element_located((By.TAG_NAME, "body"))
                 )
                 
-                # 댓글 섹션이 로드될 때까지 추가 대기 (더 다양한 선택자 시도)
+                # 댓글 섹션이 로드될 때까지 추가 대기 (타임아웃 줄임)
                 try:
                     # 여러 패턴으로 댓글 섹션 찾기
-                    wait = WebDriverWait(scraper.driver, 8)
+                    wait = WebDriverWait(scraper.driver, 3)
                     wait.until(
                         lambda driver: driver.find_elements(By.CSS_SELECTOR, "section#bo_vc") or 
                                        driver.find_elements(By.CSS_SELECTOR, "article[id^='c_']") or
@@ -67,47 +72,43 @@ class RealtimeLearner:
                     logger.debug("댓글 섹션 로드 완료")
                 except:
                     logger.debug("댓글 섹션 로드 대기 시간 초과 (계속 진행)")
-                    time.sleep(3)  # 추가 대기 시간 증가
+                    time.sleep(0.5)  # 최소 대기 시간으로 줄임
             except:
                 pass
             
-            # 스크롤하여 댓글이 동적으로 로드되도록 함 (더 적극적으로)
+            # 스크롤하여 댓글이 동적으로 로드되도록 함 (대기 시간 최소화)
             try:
                 # 댓글 섹션으로 스크롤
                 bo_vc_element = scraper.driver.find_elements(By.CSS_SELECTOR, "section#bo_vc")
                 if bo_vc_element:
                     scraper.driver.execute_script("arguments[0].scrollIntoView(true);", bo_vc_element[0])
-                    time.sleep(2)
+                    time.sleep(0.5)  # 대기 시간 줄임
                 
                 # 페이지 끝까지 스크롤 (동적 로딩 트리거)
                 scraper.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(3)  # 대기 시간 증가
-                
-                # 다시 위로 스크롤
-                scraper.driver.execute_script("window.scrollTo(0, 0);")
-                time.sleep(1)
+                time.sleep(0.5)  # 대기 시간 줄임
                 
                 # 댓글 섹션으로 다시 스크롤
                 if bo_vc_element:
                     scraper.driver.execute_script("arguments[0].scrollIntoView(true);", bo_vc_element[0])
-                    time.sleep(2)
+                    time.sleep(0.5)  # 대기 시간 줄임
             except:
                 pass
             
-            # 페이지 소스를 여러 번 시도하여 동적 로딩 대응
+            # 페이지 소스를 시도하여 동적 로딩 대응 (시도 횟수 줄임)
             soup = None
-            for attempt in range(3):
+            for attempt in range(2):  # 3번에서 2번으로 줄임
                 soup = BeautifulSoup(scraper.driver.page_source, 'html.parser')
                 bo_vc = soup.find('section', id='bo_vc')
                 if bo_vc:
                     articles = bo_vc.find_all('article', id=lambda x: x and x.startswith('c_'))
                     if articles:
-                        logger.info(f"댓글 article {len(articles)}개 발견 (시도 {attempt+1})")
+                        # 로그 간소화
                         break
-                if attempt < 2:
-                    time.sleep(2)
+                if attempt < 1:
+                    time.sleep(0.5)  # 대기 시간 줄임
                     scraper.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(1)
+                    time.sleep(0.3)  # 대기 시간 줄임
             
             comments = []
             
@@ -116,30 +117,16 @@ class RealtimeLearner:
             # 댓글 내용은 <div class="cmt_contents"> 안의 <p> 태그에 있음
             # 또는 <textarea id="save_comment_숫자"> 에도 저장되어 있음
             
-            # 디버깅: 페이지 구조 분석
-            all_articles = soup.find_all('article')
-            logger.info(f"전체 article 태그 개수: {len(all_articles)}")
-            if all_articles:
-                sample_ids = [a.get('id', 'no-id') for a in all_articles[:5]]
-                logger.info(f"article ID 샘플: {sample_ids}")
-            
             # 방법 1: section#bo_vc 안의 article 태그에서 댓글 찾기 (우선)
             bo_vc = soup.find('section', id='bo_vc')
             if bo_vc:
                 comment_articles = bo_vc.find_all('article', id=lambda x: x and x.startswith('c_'))
-                logger.info(f"section#bo_vc 안에서 article {len(comment_articles)}개 발견")
             else:
                 comment_articles = []
             
             # 방법 2: 전체 페이지에서 c_로 시작하는 article 찾기 (백업)
             if not comment_articles:
                 comment_articles = soup.find_all('article', id=lambda x: x and x.startswith('c_'))
-                logger.info(f"전체 페이지에서 article {len(comment_articles)}개 발견")
-            
-            logger.info(f"최종 댓글 article 태그 {len(comment_articles)}개 발견")
-            
-            if comment_articles:
-                logger.info(f"댓글 article 처리 시작: {len(comment_articles)}개")
                 for idx, article in enumerate(comment_articles):
                     article_id = article.get('id', 'unknown')
                     logger.debug(f"처리 중: article[{idx}] id={article_id}")
@@ -156,7 +143,7 @@ class RealtimeLearner:
                             if content and content not in comments:
                                 comments.append(content)
                                 comment_found = True
-                                logger.info(f"✅ textarea에서 댓글 추출 [{idx}]: {content[:50]}")
+                                # 로그 간소화: 각 댓글마다 출력하지 않음
                     
                     # 방법 1-2: cmt_contents 클래스 안의 p 태그 찾기 (백업)
                     if not comment_found:
@@ -172,7 +159,7 @@ class RealtimeLearner:
                                     if content and content not in comments:
                                         comments.append(content)
                                         comment_found = True
-                                        logger.info(f"✅ p 태그에서 댓글 추출 [{idx}]: {content[:50]}")
+                                        # 로그 간소화: 각 댓글마다 출력하지 않음
                     
                     # 방법 1-3: article 내의 모든 p 태그에서 찾기 (최후의 수단)
                     if not comment_found:
@@ -191,22 +178,18 @@ class RealtimeLearner:
                                 if not any(keyword in content for keyword in exclude_keywords):
                                     if content and content not in comments:
                                         comments.append(content)
-                                        logger.info(f"✅ article p 태그에서 댓글 추출 [{idx}]: {content[:50]}")
+                                        # 로그 간소화: 각 댓글마다 출력하지 않음
                                         break
                     
-                    if not comment_found:
-                        logger.warning(f"⚠️ article[{idx}] id={article_id}에서 댓글을 찾지 못했습니다")
+                    # 로그 간소화: 개별 실패 로그 제거
             
             # 방법 2: section#bo_vc에서 직접 찾기 (백업)
             if not comments:
-                logger.info("article 태그에서 댓글을 찾지 못해 section#bo_vc에서 검색...")
                 bo_vc = soup.find('section', id='bo_vc')
                 if bo_vc:
-                    logger.info(f"section#bo_vc 발견, 내부 구조 분석 중...")
                     # section 내부의 모든 요소 확인
                     all_textareas = bo_vc.find_all('textarea')
                     all_divs = bo_vc.find_all('div', class_='cmt_contents')
-                    logger.info(f"section 내부 - textarea: {len(all_textareas)}개, cmt_contents div: {len(all_divs)}개")
                     
                     # 방법 2-1: 모든 textarea에서 찾기 (가장 정확) - ID 패턴 확장
                     textareas = bo_vc.find_all('textarea', id=lambda x: x and ('save_comment_' in str(x) or 'comment' in str(x).lower()))
@@ -267,7 +250,6 @@ class RealtimeLearner:
             
             # 방법 3: 페이지 전체에서 textarea 찾기 (최후의 수단)
             if not comments:
-                logger.info("section에서도 댓글을 찾지 못해 페이지 전체에서 textarea 검색...")
                 all_textareas = soup.find_all('textarea', id=lambda x: x and 'comment' in str(x).lower())
                 for textarea in all_textareas:
                     content = textarea.get_text(strip=True)
@@ -289,7 +271,7 @@ class RealtimeLearner:
                     seen.add(comment_normalized)
                     unique_comments.append(comment)
             
-            logger.info(f"게시글에서 {len(unique_comments)}개의 댓글 수집: {post_url[:50]}...")
+            # 로그 간소화: GUI에서만 표시
             
             # 디버깅: 댓글을 찾지 못한 경우 상세 로그
             if len(unique_comments) == 0:

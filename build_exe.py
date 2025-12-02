@@ -24,6 +24,10 @@ def build_exe():
         '--hidden-import=beautifulsoup4',
         '--hidden-import=openai',
         '--hidden-import=cryptography',
+        '--hidden-import=selenium',
+        '--hidden-import=webdriver_manager',
+        '--hidden-import=config_manager',
+        '--hidden-import=realtime_learner',
         '--collect-all=tkinter',
         '--noconsole',  # 콘솔 창 없이 실행
     ]

@@ -11,29 +11,38 @@ def build_exe():
     """exe 파일 빌드"""
     print("exe 파일 빌드를 시작합니다...")
     
-    # PyInstaller 옵션
-    options = [
-        'main.py',
-        '--name=온카판_자동댓글_매크로',
-        '--onefile',  # 단일 실행 파일
-        '--windowed',  # 콘솔 창 숨기기
-        '--icon=NONE',  # 아이콘은 나중에 추가 가능
-        '--add-data=config.json;.' if os.path.exists('config.json') else '',
-        '--hidden-import=tkinter',
-        '--hidden-import=requests',
-        '--hidden-import=beautifulsoup4',
-        '--hidden-import=openai',
-        '--hidden-import=cryptography',
-        '--hidden-import=selenium',
-        '--hidden-import=webdriver_manager',
-        '--hidden-import=config_manager',
-        '--hidden-import=realtime_learner',
-        '--collect-all=tkinter',
-        '--noconsole',  # 콘솔 창 없이 실행
-    ]
+    # .spec 파일이 있으면 사용, 없으면 옵션으로 빌드
+    spec_file = '온카판_자동댓글_매크로.spec'
     
-    # 빈 문자열 제거
-    options = [opt for opt in options if opt]
+    if os.path.exists(spec_file):
+        print(f"{spec_file} 파일을 사용하여 빌드합니다...")
+        options = [spec_file, '--clean']  # --clean으로 이전 빌드 정리
+    else:
+        print("spec 파일이 없어 옵션으로 빌드합니다...")
+        # PyInstaller 옵션
+        options = [
+            'main.py',
+            '--name=온카판_자동댓글_매크로',
+            '--onefile',  # 단일 실행 파일
+            '--windowed',  # 콘솔 창 숨기기
+            '--icon=NONE',  # 아이콘은 나중에 추가 가능
+            '--add-data=config.json;.' if os.path.exists('config.json') else '',
+            '--hidden-import=tkinter',
+            '--hidden-import=_tkinter',
+            '--hidden-import=requests',
+            '--hidden-import=beautifulsoup4',
+            '--hidden-import=openai',
+            '--hidden-import=cryptography',
+            '--hidden-import=selenium',
+            '--hidden-import=webdriver_manager',
+            '--hidden-import=config_manager',
+            '--hidden-import=realtime_learner',
+            '--collect-all=tkinter',
+            '--noconsole',  # 콘솔 창 없이 실행
+        ]
+        
+        # 빈 문자열 제거
+        options = [opt for opt in options if opt]
     
     try:
         PyInstaller.__main__.run(options)
@@ -41,6 +50,8 @@ def build_exe():
         print("dist 폴더에 exe 파일이 생성되었습니다.")
     except Exception as e:
         print(f"빌드 오류: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     build_exe()

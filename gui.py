@@ -11,6 +11,19 @@ from config_manager import ConfigManager
 import time
 import random
 import logging
+import json
+import os
+import sys
+from datetime import datetime, timedelta
+
+# 파일 락 지원 (플랫폼별)
+try:
+    if os.name == 'nt':  # Windows
+        import msvcrt
+    else:  # Unix/Linux
+        import fcntl
+except ImportError:
+    pass  # 파일 락 미지원 환경에서는 계속 진행
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,13 +48,14 @@ class MacroGUI:
             self.root.title("온카판 자동 댓글 매크로 (테스트 모드)")
         else:
             self.root.title("온카판 자동 댓글 매크로")
-        self.root.geometry("600x700")
+        self.root.geometry("600x750")
         self.root.resizable(False, False)
         
         self.force_test_mode = force_test_mode
         self.config_manager = ConfigManager()
         self.scraper = None
         self.ai_generator = None
+        self.learner = None  # RealtimeLearner 인스턴스
         self.is_running = False
         self.worker_thread = None
         
@@ -93,9 +107,28 @@ class MacroGUI:
         self.max_delay_entry.insert(0, "5")
         self.max_delay_entry.grid(row=2, column=1, pady=2, padx=5, sticky=tk.W)
         
+        # 댓글 작성 횟수 제한 설정
+        limit_frame = ttk.LabelFrame(main_frame, text="댓글 작성 횟수 제한", padding="10")
+        limit_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Label(limit_frame, text="작성 횟수 제한:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        limit_input_frame = ttk.Frame(limit_frame)
+        limit_input_frame.grid(row=0, column=1, pady=2, padx=5, sticky=tk.W)
+        
+        self.limit_mode_var = tk.StringVar(value="unlimited")
+        ttk.Radiobutton(limit_input_frame, text="무한정", variable=self.limit_mode_var, value="unlimited", 
+                       command=self._on_limit_mode_change).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(limit_input_frame, text="제한:", variable=self.limit_mode_var, value="limited",
+                       command=self._on_limit_mode_change).pack(side=tk.LEFT, padx=5)
+        
+        self.limit_entry = ttk.Entry(limit_input_frame, width=15, state=tk.DISABLED)
+        self.limit_entry.insert(0, "1000")
+        self.limit_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Label(limit_input_frame, text="번").pack(side=tk.LEFT, padx=2)
+        
         # 테스트 모드 체크박스
         test_frame = ttk.Frame(main_frame)
-        test_frame.grid(row=3, column=0, columnspan=2, pady=5)
+        test_frame.grid(row=4, column=0, columnspan=2, pady=5)
         
         self.test_mode_var = tk.BooleanVar(value=self.force_test_mode)
         test_check = ttk.Checkbutton(test_frame, text="테스트 모드 (실제 댓글 작성 안 함)", variable=self.test_mode_var)
@@ -110,7 +143,7 @@ class MacroGUI:
         
         # 버튼 프레임
         button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=4, column=0, columnspan=2, pady=10)
+        button_frame.grid(row=5, column=0, columnspan=2, pady=10)
         
         self.save_btn = ttk.Button(button_frame, text="설정 저장", command=self.save_config)
         self.save_btn.pack(side=tk.LEFT, padx=5)
@@ -123,20 +156,20 @@ class MacroGUI:
         
         # 로그 영역
         log_frame = ttk.LabelFrame(main_frame, text="실행 로그", padding="10")
-        log_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        log_frame.grid(row=6, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
         
         self.log_text = scrolledtext.ScrolledText(log_frame, height=15, width=70, state=tk.DISABLED)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
         # 상태바
         self.status_label = ttk.Label(main_frame, text="대기 중...", relief=tk.SUNKEN)
-        self.status_label.grid(row=6, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        self.status_label.grid(row=7, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
         # 그리드 가중치 설정
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(5, weight=1)
+        main_frame.rowconfigure(6, weight=1)
     
     def log(self, message: str):
         """로그 메시지 추가"""
@@ -164,7 +197,24 @@ class MacroGUI:
             self.max_delay_entry.delete(0, tk.END)
             self.max_delay_entry.insert(0, "5")
             self.max_delay_entry.config(state='readonly')
+            
+            # 댓글 작성 횟수 제한 설정 로드 (호환성 처리)
+            limit_mode = config.get('limit_mode', 'unlimited')
+            limit_count = config.get('limit_count', 1000)
+            self.limit_mode_var.set(limit_mode)
+            self.limit_entry.delete(0, tk.END)
+            self.limit_entry.insert(0, str(limit_count))
+            # 필드 활성화 상태 업데이트
+            self._on_limit_mode_change()
+            
             self.log("저장된 설정을 불러왔습니다.")
+    
+    def _on_limit_mode_change(self):
+        """횟수 제한 모드 변경 시 입력 필드 활성화/비활성화"""
+        if self.limit_mode_var.get() == "limited":
+            self.limit_entry.config(state=tk.NORMAL)
+        else:
+            self.limit_entry.config(state=tk.DISABLED)
     
     def save_config(self):
         """설정 저장"""
@@ -182,11 +232,25 @@ class MacroGUI:
             min_delay = 3
             max_delay = 5
             
+            # 댓글 작성 횟수 제한 설정
+            limit_mode = self.limit_mode_var.get()
+            if limit_mode == "limited":
+                try:
+                    limit_count = int(self.limit_entry.get())
+                    if limit_count <= 0:
+                        raise ValueError("횟수는 1 이상이어야 합니다.")
+                except ValueError as e:
+                    messagebox.showerror("오류", f"작성 횟수는 양수로 입력해주세요.\n{str(e)}")
+                    return
+            else:
+                limit_count = 0  # 무한정
+            
         except ValueError:
             messagebox.showerror("오류", "대기 시간은 숫자로 입력해주세요.")
             return
         
-        self.config_manager.save_config(username, password, api_key, delay, min_delay, max_delay)
+        self.config_manager.save_config(username, password, api_key, delay, min_delay, max_delay, 
+                                       limit_mode=limit_mode, limit_count=limit_count)
         messagebox.showinfo("성공", "설정이 저장되었습니다.")
         self.log("설정이 저장되었습니다.")
     
@@ -205,6 +269,20 @@ class MacroGUI:
             # 최소/최대 대기 시간은 고정값 사용 (3초, 5초)
             min_delay = 3
             max_delay = 5
+            
+            # 댓글 작성 횟수 제한 설정
+            limit_mode = self.limit_mode_var.get()
+            if limit_mode == "limited":
+                try:
+                    limit_count = int(self.limit_entry.get())
+                    if limit_count <= 0:
+                        raise ValueError("횟수는 1 이상이어야 합니다.")
+                except ValueError as e:
+                    messagebox.showerror("오류", f"작성 횟수는 양수로 입력해주세요.\n{str(e)}")
+                    return
+            else:
+                limit_count = 0  # 무한정
+            
         except ValueError:
             messagebox.showerror("오류", "대기 시간은 숫자로 입력해주세요.")
             return
@@ -225,13 +303,14 @@ class MacroGUI:
         # 워커 스레드 시작
         self.worker_thread = threading.Thread(
             target=self.macro_worker,
-            args=(username, password, api_key, delay, min_delay, max_delay),
+            args=(username, password, api_key, delay, min_delay, max_delay, limit_mode, limit_count),
             daemon=True
         )
         self.worker_thread.start()
         
-        self.log("매크로를 시작합니다...")
-        self.status_label.config(text="실행 중...")
+        limit_text = "무한정" if limit_mode == "unlimited" else f"{limit_count}번"
+        self.log(f"매크로를 시작합니다... (제한: {limit_text})")
+        self.status_label.config(text=f"실행 중... (제한: {limit_text})")
     
     def stop_macro(self):
         """매크로 중지"""
@@ -255,7 +334,8 @@ class MacroGUI:
         self.status_label.config(text="중지됨")
     
     def macro_worker(self, username: str, password: str, api_key: str, 
-                    delay: int, min_delay: int, max_delay: int):
+                    delay: int, min_delay: int, max_delay: int, 
+                    limit_mode: str = "unlimited", limit_count: int = 0):
         """매크로 작업 스레드"""
         max_retries = 3
         retry_count = 0
@@ -265,7 +345,18 @@ class MacroGUI:
                 # 스크래퍼 및 AI 생성기 초기화
                 test_mode = self.test_mode_var.get()
                 self.scraper = OncaPanScraper(test_mode=test_mode)
-                self.ai_generator = AICommentGenerator(api_key)
+                # RealtimeLearner 초기화 (학습 기능 포함)
+                try:
+                    from realtime_learner import RealtimeLearner
+                    self.learner = RealtimeLearner()
+                    # 학습 분석기 가져오기
+                    learning_analyzer = self.learner.learning_analyzer if hasattr(self.learner, 'learning_analyzer') else None
+                except Exception as e:
+                    logger.warning(f"RealtimeLearner 초기화 실패: {e}")
+                    self.learner = None
+                    learning_analyzer = None
+                
+                self.ai_generator = AICommentGenerator(api_key, learning_analyzer=learning_analyzer)
                 
                 if test_mode:
                     self.root.after(0, partial(self.log, "⚠️ 테스트 모드로 실행됩니다. 실제 댓글은 작성되지 않습니다."))
@@ -286,11 +377,31 @@ class MacroGUI:
                 self.root.after(0, lambda: self.log("로그인 성공!"))
                 retry_count = 0  # 로그인 성공 시 재시도 카운트 리셋
                 
-                # 이미 댓글 단 게시글 추적
-                commented_posts = set()
+                # 이미 댓글 단 게시글 추적 (파일로 저장하여 영구 보존)
+                # exe 실행 시 현재 디렉토리에 파일 생성
+                try:
+                    if getattr(sys, 'frozen', False):
+                        # PyInstaller로 빌드된 exe인 경우
+                        base_path = os.path.dirname(sys.executable)
+                    else:
+                        # 스크립트로 실행하는 경우
+                        base_path = os.path.dirname(os.path.abspath(__file__))
+                except:
+                    base_path = os.getcwd()
+                commented_posts_file = os.path.join(base_path, "commented_posts.json")
+                commented_posts = self._load_commented_posts(commented_posts_file)
+                if commented_posts:
+                    self.root.after(0, lambda: self.log(f"📝 이전 댓글 작성 이력 로드: {len(commented_posts)}개 게시글"))
+                
+                # 댓글 작성 횟수 카운터
+                comment_count = 0
+                limit_reached = False
+                # 배치 저장을 위한 카운터
+                save_counter = 0
+                SAVE_INTERVAL = 5  # 5개마다 저장
                 
                 # 메인 루프
-                while self.is_running:
+                while self.is_running and not limit_reached:
                     try:
                         # 게시글 목록 가져오기
                         posts = self.scraper.get_post_list(limit=20)
@@ -317,27 +428,63 @@ class MacroGUI:
                             # 이미 댓글을 달았는지 확인
                             if self.scraper.has_commented(post_url, username):
                                 commented_posts.add(post_id)
+                                save_counter += 1
+                                # 배치 저장 (5개마다 또는 중요한 시점에)
+                                if save_counter >= SAVE_INTERVAL:
+                                    self._save_commented_posts(commented_posts, commented_posts_file)
+                                    save_counter = 0
                                 continue
                             
-                            # 24시간 이내 게시글인지 확인 (추가 검증)
+                            # 24시간 이내 게시글인지 확인 (개선된 날짜 파싱)
                             post_datetime_str = post.get('datetime')
                             if post_datetime_str:
-                                from datetime import datetime, timedelta
                                 try:
-                                    # 날짜 파싱 (간단한 검증)
                                     now = datetime.now()
-                                    if '-' in post_datetime_str:
-                                        # 날짜 형식 - 추가 검증
+                                    post_date = None
+                                    
+                                    # 다양한 날짜 형식 파싱 시도
+                                    date_formats = [
+                                        '%Y-%m-%d %H:%M:%S',
+                                        '%Y-%m-%d %H:%M',
+                                        '%Y-%m-%d',
+                                        '%m-%d %H:%M',
+                                        '%m-%d',
+                                        '%Y.%m.%d %H:%M',
+                                        '%Y.%m.%d',
+                                    ]
+                                    
+                                    for fmt in date_formats:
+                                        try:
+                                            post_date = datetime.strptime(post_datetime_str.strip(), fmt)
+                                            # 연도가 없는 경우 현재 연도 사용
+                                            if '%Y' not in fmt:
+                                                post_date = post_date.replace(year=now.year)
+                                                if post_date > now:
+                                                    post_date = post_date.replace(year=now.year - 1)
+                                            break
+                                        except ValueError:
+                                            continue
+                                    
+                                    # 파싱 실패 시 간단한 형식 재시도
+                                    if post_date is None and '-' in post_datetime_str:
                                         parts = post_datetime_str.split('-')
-                                        if len(parts) == 2:
-                                            month, day = int(parts[0]), int(parts[1])
-                                            post_date = now.replace(month=month, day=day, hour=0, minute=0, second=0, microsecond=0)
-                                            if post_date > now:
-                                                post_date = post_date.replace(year=now.year - 1)
-                                            if now - post_date > timedelta(hours=24):
-                                                continue
-                                except:
-                                    pass  # 날짜 파싱 실패 시 계속 진행
+                                        if len(parts) >= 2:
+                                            try:
+                                                month, day = int(parts[0]), int(parts[1].split()[0] if ' ' in parts[1] else parts[1])
+                                                post_date = now.replace(month=month, day=day, hour=0, minute=0, second=0, microsecond=0)
+                                                if post_date > now:
+                                                    post_date = post_date.replace(year=now.year - 1)
+                                            except (ValueError, IndexError):
+                                                pass
+                                    
+                                    # 24시간 이내 게시글만 처리
+                                    if post_date and now - post_date > timedelta(hours=24):
+                                        continue
+                                        
+                                except Exception as e:
+                                    logger.debug(f"날짜 파싱 실패: {post_datetime_str}, 오류: {e}")
+                                    # 날짜 파싱 실패 시 계속 진행 (24시간 체크 스킵)
+                                    pass
                             
                             # 게시글 내용 가져오기
                             post_title = post.get('title', '')[:30]
@@ -369,9 +516,10 @@ class MacroGUI:
                             
                             # 실시간 학습: 게시글에서 댓글 수집
                             try:
-                                from realtime_learner import RealtimeLearner
-                                learner = RealtimeLearner()
-                                actual_comments = learner.collect_comments_from_post(self.scraper, post_url)
+                                if not self.learner:
+                                    from realtime_learner import RealtimeLearner
+                                    self.learner = RealtimeLearner()
+                                actual_comments = self.learner.collect_comments_from_post(self.scraper, post_url)
                                 
                                 # 3. 댓글들 (전체 목록)
                                 self.root.after(0, partial(self.log, f""))
@@ -391,11 +539,10 @@ class MacroGUI:
                             
                             # 디버그 로그에 게시글 정보 기록
                             try:
-                                import datetime
                                 debug_log_file = "ai_debug_log.txt"
                                 with open(debug_log_file, 'a', encoding='utf-8') as f:
                                     f.write("\n" + "="*80 + "\n")
-                                    f.write(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 게시글 정보\n")
+                                    f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 게시글 정보\n")
                                     f.write("="*80 + "\n\n")
                                     f.write("【게시글 제목】\n")
                                     f.write(f"{actual_post_title if actual_post_title else '(제목 없음)'}\n\n")
@@ -406,7 +553,7 @@ class MacroGUI:
                                         f.write(f"\n... (전체 {len(post_content)}자 중 500자만 표시)")
                                     f.write("\n\n")
                             except Exception as e:
-                                pass
+                                logger.debug(f"디버그 로그 기록 실패: {e}")
                             
                             # 댓글 생성 가능 여부 확인
                             if not self.ai_generator.can_generate_comment(post_content):
@@ -426,9 +573,17 @@ class MacroGUI:
                             time.sleep(wait_time)
                             
                             # AI 댓글 생성
-                            comment = self.ai_generator.generate_comment(post_content, actual_post_title, actual_comments)
-                            
-                            if not comment:
+                            try:
+                                self.root.after(0, partial(self.log, f"🤖 AI 댓글 생성 중..."))
+                                comment = self.ai_generator.generate_comment(post_content, actual_post_title, actual_comments)
+                                
+                                if not comment:
+                                    self.root.after(0, partial(self.log, f"❌ AI 댓글 생성 실패 (댓글 없음 또는 생성 오류)"))
+                                    logger.warning(f"AI 댓글 생성 실패: post_title={actual_post_title}, comments_count={len(actual_comments) if actual_comments else 0}")
+                                    continue
+                            except Exception as e:
+                                self.root.after(0, partial(self.log, f"❌ AI 댓글 생성 오류: {str(e)}"))
+                                logger.error(f"AI 댓글 생성 예외 발생: {e}", exc_info=True)
                                 continue
                             
                             # 4. AI가 작성한 댓글 (전체)
@@ -436,10 +591,43 @@ class MacroGUI:
                             self.root.after(0, partial(self.log, f"🤖 【AI가 작성한 댓글】"))
                             self.root.after(0, partial(self.log, f"{comment}"))
                             
+                            # 학습 로그 기록 (테스트 모드 포함, 댓글 작성 전에 기록)
+                            if self.learner:
+                                try:
+                                    self.learner.log_post_processing(
+                                        actual_post_title or "",
+                                        post_content or "",
+                                        actual_comments or [],
+                                        comment,
+                                        post_url
+                                    )
+                                except Exception as e:
+                                    logger.error(f"학습 로그 기록 오류: {e}")
+                            
                             if self.scraper.write_comment(post_url, comment):
                                 commented_posts.add(post_id)
-                                self.root.after(0, partial(self.log, f"✅ 댓글 작성 완료"))
-                                status_text = f"댓글 작성 완료: {len(commented_posts)}개"
+                                comment_count += 1
+                                save_counter += 1
+                                
+                                # 배치 저장 (5개마다 또는 목표 달성 시)
+                                if save_counter >= SAVE_INTERVAL or (limit_mode == "limited" and comment_count >= limit_count):
+                                    self._save_commented_posts(commented_posts, commented_posts_file)
+                                    save_counter = 0
+                                
+                                self.root.after(0, partial(self.log, f"✅ 댓글 작성 완료 ({comment_count}번째)"))
+                                
+                                # 횟수 제한 체크
+                                if limit_mode == "limited" and comment_count >= limit_count:
+                                    limit_reached = True
+                                    # 목표 달성 시 즉시 저장
+                                    self._save_commented_posts(commented_posts, commented_posts_file)
+                                    self.root.after(0, partial(self.log, f"🎯 목표 횟수 달성: {limit_count}번 작성 완료"))
+                                    self.root.after(0, partial(self.log, "매크로를 자동으로 중지합니다."))
+                                    break
+                                
+                                status_text = f"댓글 작성 완료: {comment_count}번"
+                                if limit_mode == "limited":
+                                    status_text += f" / 목표: {limit_count}번"
                                 self.root.after(0, partial(self.status_label.config, text=status_text))
                             else:
                                 self.root.after(0, partial(self.log, f"❌ 댓글 작성 실패"))
@@ -448,6 +636,15 @@ class MacroGUI:
                             
                             # 게시글 간 대기 시간
                             time.sleep(delay)
+                        
+                        # 남은 변경사항 저장
+                        if save_counter > 0:
+                            self._save_commented_posts(commented_posts, commented_posts_file)
+                            save_counter = 0
+                        
+                        # 횟수 제한에 도달했는지 확인
+                        if limit_reached:
+                            break
                         
                         # 게시글 목록 새로고침 대기
                         time.sleep(60)  # 1분마다 게시글 목록 새로고침
@@ -458,6 +655,12 @@ class MacroGUI:
                         self.root.after(0, partial(self.log, error_msg))
                         time.sleep(10)
                         continue
+                    
+                    # 횟수 제한에 도달했는지 확인
+                    if limit_reached:
+                        self.root.after(0, lambda: self.log(f"✅ 목표 횟수 달성: {comment_count}번 작성 완료"))
+                        self.root.after(0, self.stop_macro)
+                        break
                 
             except Exception as e:
                 logger.error(f"매크로 작업 오류: {e}", exc_info=True)
@@ -474,4 +677,134 @@ class MacroGUI:
             finally:
                 if self.scraper:
                     self.scraper.close()
+    
+    def _load_commented_posts(self, filename: str) -> set:
+        """댓글 작성 이력 로드 (파일 크기 관리 포함)"""
+        try:
+            if os.path.exists(filename):
+                with open(filename, 'r', encoding='utf-8') as f:
+                    # Windows에서 파일 락 시도
+                    try:
+                        if os.name == 'nt':  # Windows
+                            try:
+                                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                            except NameError:
+                                pass  # msvcrt가 없는 경우
+                        else:  # Unix/Linux
+                            try:
+                                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                            except NameError:
+                                pass  # fcntl이 없는 경우
+                    except:
+                        pass  # 락 실패해도 계속 진행
+                    
+                    data = json.load(f)
+                    
+                    # 락 해제
+                    try:
+                        if os.name == 'nt':
+                            try:
+                                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                            except NameError:
+                                pass
+                        else:
+                            try:
+                                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                            except NameError:
+                                pass
+                    except:
+                        pass
+                    
+                    if isinstance(data, list):
+                        post_ids = set(data)
+                    elif isinstance(data, dict) and 'post_ids' in data:
+                        post_ids = set(data['post_ids'])
+                    else:
+                        post_ids = set()
+                    
+                    # 파일 크기 관리: 최대 10000개만 유지 (오래된 것부터 제거)
+                    MAX_POSTS = 10000
+                    if len(post_ids) > MAX_POSTS:
+                        post_ids = set(list(post_ids)[-MAX_POSTS:])  # 최신 것만 유지
+                        logger.info(f"댓글 작성 이력이 {MAX_POSTS}개를 초과하여 최신 {MAX_POSTS}개만 유지합니다.")
+                    
+                    return post_ids
+            return set()
+        except Exception as e:
+            logger.warning(f"댓글 작성 이력 로드 실패: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return set()
+    
+    def _save_commented_posts(self, commented_posts: set, filename: str):
+        """댓글 작성 이력 저장 (파일 락 및 크기 관리 포함)"""
+        try:
+            # 파일 크기 관리: 최대 10000개만 유지
+            MAX_POSTS = 10000
+            if len(commented_posts) > MAX_POSTS:
+                commented_posts = set(list(commented_posts)[-MAX_POSTS:])
+                logger.info(f"댓글 작성 이력이 {MAX_POSTS}개를 초과하여 최신 {MAX_POSTS}개만 유지합니다.")
+            
+            data = {
+                'post_ids': list(commented_posts),
+                'count': len(commented_posts),
+                'last_updated': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            # 임시 파일로 저장 후 원자적 이동 (충돌 방지)
+            temp_filename = filename + '.tmp'
+            with open(temp_filename, 'w', encoding='utf-8') as f:
+                # Windows에서 파일 락 시도
+                try:
+                    if os.name == 'nt':  # Windows
+                        try:
+                            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                        except NameError:
+                            pass  # msvcrt가 없는 경우
+                    else:  # Unix/Linux
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                        except NameError:
+                            pass  # fcntl이 없는 경우
+                except:
+                    pass  # 락 실패해도 계속 진행
+                
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())  # 디스크에 강제 쓰기
+                
+                # 락 해제
+                try:
+                    if os.name == 'nt':
+                        try:
+                            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                        except NameError:
+                            pass
+                    else:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        except NameError:
+                            pass
+                except:
+                    pass
+            
+            # 원자적 이동 (Windows에서는 replace 사용)
+            if os.name == 'nt':
+                if os.path.exists(filename):
+                    os.replace(temp_filename, filename)
+                else:
+                    os.rename(temp_filename, filename)
+            else:
+                os.replace(temp_filename, filename)
+                
+        except Exception as e:
+            logger.error(f"댓글 작성 이력 저장 실패: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            # 임시 파일 정리
+            try:
+                if os.path.exists(temp_filename):
+                    os.remove(temp_filename)
+            except:
+                pass
 

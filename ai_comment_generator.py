@@ -19,9 +19,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class AICommentGenerator:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, learning_analyzer=None):
         self.client = OpenAI(api_key=api_key)
         self.model = "gpt-3.5-turbo"
+        self.learning_analyzer = learning_analyzer  # 학습 분석기 (선택적)
     
     def generate_comment(self, post_content: str, post_title: str = "", actual_comments: List[str] = None) -> Optional[str]:
         """
@@ -37,6 +38,13 @@ class AICommentGenerator:
             logger.info("실제 댓글이 없는 게시글은 댓글 작성하지 않습니다.")
             return None
         
+        # 본문 내용 저장 (후처리에서 사용)
+        self._current_post_content = post_content
+        self._current_post_title = post_title
+        
+        # 댓글이 적을 때(3개 이하) 본문 분석 강화 플래그
+        has_few_comments = len(actual_comments) <= 3
+        
         max_retries = 3
         
         # 키워드 미리 추출 (검증용)
@@ -49,16 +57,17 @@ class AICommentGenerator:
                 safe_content = self._safe_string(post_content[:500])  # 본문은 500자로 제한
                 
                 # 실제 댓글이 있으면 무조건 모방 모드
+                # 댓글이 적을 때는 본문 분석 강화
                 comment = self._generate_with_actual_comments(
-                    safe_title, safe_content, actual_comments, keywords
+                    safe_title, safe_content, actual_comments, keywords, has_few_comments
                 )
                 
                 if comment:
                     # 로그 간소화: 생성된 댓글만 간단히 출력
                     logger.debug(f"[시도 {attempt + 1}] 생성된 댓글: {comment}")
                     
-                    # 키워드 포함 여부 확인
-                    if keywords:
+                    # 키워드 포함 여부 확인 (댓글이 적을 때는 완화)
+                    if keywords and not has_few_comments:  # 댓글이 적을 때는 키워드 검증 완화
                         if not self._validate_keywords_in_comment(comment, keywords):
                             logger.warning(f"[시도 {attempt + 1}] 키워드 미포함으로 필터링. 원본: '{comment}', 키워드: {keywords}")
                             if attempt < max_retries - 1:
@@ -73,8 +82,8 @@ class AICommentGenerator:
                     
                     # 후처리 후에도 유효한 댓글이면 반환
                     if processed_comment:
-                        # 키워드 재확인 (후처리 후)
-                        if keywords:
+                        # 키워드 재확인 (후처리 후, 댓글이 적을 때는 완화)
+                        if keywords and not has_few_comments:  # 댓글이 적을 때는 키워드 검증 완화
                             if not self._validate_keywords_in_comment(processed_comment, keywords):
                                 logger.warning(f"[시도 {attempt + 1}] 후처리 후 키워드 미포함. 원본: '{comment}' -> 처리 후: '{processed_comment}', 키워드: {keywords}")
                                 if attempt < max_retries - 1:
@@ -120,22 +129,53 @@ class AICommentGenerator:
         return None
     
     def _extract_keywords(self, comments: List[str]) -> List[str]:
-        """댓글에서 가장 많이 나온 키워드 추출 (부분 문자열 포함)"""
-        # 모든 댓글에서 한글 단어 추출 (부분 문자열도 포함)
+        """댓글에서 가장 많이 나온 키워드 추출 (단어 경계 인식 개선)"""
+        # 커뮤니티 특수 용어 사전 (우선 추출)
+        special_terms = [
+            '담타', '렉카', '포전', '포바', '단포바', '깊전', '댓노', '멘징',
+            '골스', '오클', '느바', '크보', '믈브', '해축', '새축', '일야',
+            '담배', '쌈배', '맛담', '맛점', '맛저', '맛아', '맛커', '맛런치',
+            '무브', '후땡', '고우', '꿀잼', '개꿀잼', '쫄깃', '연장', '페이백',
+            '추워', '춥', '감기', '한숨', '식곤증', '졸립', '런치', '점심',
+            '벳계', '벳컨', '88', '16', '쿨거', '입금', '지연', '조회수',
+            '핫식스', '원플원', '도핑', '돌발', '돌대기', '신라면', '코코아',
+            '플핸', '오바', '마핸', '석살', '석사', '독사', '훈카', '화력',
+            '햄부기', '야키토리', '무한도전', '런닝맨'
+        ]
+        
         all_words = []
+        found_special_terms = []
+        
         for comment in comments:
-            # 한글만 추출
-            korean_text = re.sub(r'[^가-힣]', '', comment)
+            # 특수 용어 우선 검색
+            comment_lower = comment.lower()
+            for term in special_terms:
+                if term in comment_lower and term not in found_special_terms:
+                    found_special_terms.append(term)
             
-            # 2-5글자 길이의 모든 부분 문자열 추출
-            for length in range(2, min(6, len(korean_text) + 1)):
-                for i in range(len(korean_text) - length + 1):
-                    word = korean_text[i:i+length]
-                    if len(word) >= 2:
-                        all_words.append(word)
+            # 띄어쓰기 기준으로 단어 분리 (우선)
+            words_by_space = re.findall(r'[가-힣]+', comment)
+            for word in words_by_space:
+                if 2 <= len(word) <= 4:  # 2-4글자만
+                    all_words.append(word)
+            
+            # 띄어쓰기로 분리되지 않은 경우, 한글만 추출하여 부분 문자열 추출 (보조)
+            korean_text = re.sub(r'[^가-힣]', '', comment)
+            if len(korean_text) > 0:
+                # 2-4글자 길이의 부분 문자열 추출 (단어 경계 고려)
+                for length in range(2, min(5, len(korean_text) + 1)):  # 최대 4글자
+                    for i in range(len(korean_text) - length + 1):
+                        word = korean_text[i:i+length]
+                        if len(word) >= 2:
+                            all_words.append(word)
         
         # 빈도수 계산
         word_counter = Counter(all_words)
+        
+        # 특수 용어는 우선 추가
+        for term in found_special_terms:
+            if term in word_counter:
+                word_counter[term] += 10  # 가중치 부여
         
         # 제외할 일반적인 단어들 및 어미/접미사
         exclude_words = {
@@ -154,7 +194,57 @@ class AICommentGenerator:
             '먹네', '먹네요', '먹나', '먹나요', '먹는', '먹는데',
             '드네', '드네요', '드나', '드나요', '드는', '드는데',
             '해야', '해야지', '해야지', '해야', '해야', '해야',
+            # 어미 패턴 (강화)
+            '입니', '습니', '시다', '게맞', '게되', '게하', '시길', '하셨', '하셔', '하셨어',
+            '재밋', '재밌', '재밌습', '재밋습', '재밋니', '재밌니',
+            '맛담배', '담배하', '고생하', '화이팅해', '저도하고', '생각',
+            # 조사
+            '은', '는', '이', '가', '을', '를', '의', '에', '에서', '와', '과',
+            '도', '만', '조차', '까지', '부터', '에게', '한테', '께', '로', '으로',
+            '처럼', '같이', '만큼', '보다', '마다', '대로', '커녕',
+            # 의미 없는 단어
+            '아자', '하고', '하고싶', '하고프', '하고싶네', '하고프네',
         }
+        
+        # 어미로 끝나는 패턴 (제외)
+        exclude_endings = (
+            '합니다', '니다', '네요', '해요', '이에요', '예요', '이네요', '이죠',
+            '이다', '입니다', '이야', '야', '어요', '아요', '지요', '죠',
+            '거예요', '거야', '거다', '되요', '돼요', '되네', '되나', '되는',
+            '될', '되면', '되니', '하네', '하나', '하는', '할', '하면',
+            '하니', '하죠', '하세요', '가요', '가네', '가는', '갈', '가면',
+            '가니', '가죠', '가세요', '와요', '와네', '오는', '올', '오면',
+            '오니', '오죠', '오세요', '있어', '있네', '있는', '있을', '있으면',
+            '있니', '있죠', '있어요', '없어', '없네', '없는', '없을', '없으면',
+            '없니', '없죠', '없어요', '좋아', '좋네', '좋은', '좋을', '좋으면',
+            '좋니', '좋죠', '좋아요', '나와', '나네', '나는', '날', '나면',
+            '나니', '나죠', '나와요', '보네', '보는', '볼', '보면', '보니',
+            '보죠', '보세요', '먹네', '먹는', '먹을', '먹으면', '먹니', '먹죠',
+            '먹어요', '하시', '하셔', '하신', '하실', '하시면', '하시니', '하시죠',
+        )
+        
+        # 어미로 끝나는 패턴 (제외)
+        exclude_endings = (
+            '합니다', '니다', '네요', '해요', '이에요', '예요', '이네요', '이죠',
+            '이다', '입니다', '이야', '야', '어요', '아요', '지요', '죠',
+            '거예요', '거야', '거다', '되요', '돼요', '되네', '되나', '되는',
+            '될', '되면', '되니', '하네', '하나', '하는', '할', '하면',
+            '하니', '하죠', '하세요', '가요', '가네', '가는', '갈', '가면',
+            '가니', '가죠', '가세요', '와요', '와네', '오는', '올', '오면',
+            '오니', '오죠', '오세요', '있어', '있네', '있는', '있을', '있으면',
+            '있니', '있죠', '있어요', '없어', '없네', '없는', '없을', '없으면',
+            '없니', '없죠', '없어요', '좋아', '좋네', '좋은', '좋을', '좋으면',
+            '좋니', '좋죠', '좋아요', '나와', '나네', '나는', '날', '나면',
+            '나니', '나죠', '나와요', '보네', '보는', '볼', '보면', '보니',
+            '보죠', '보세요', '먹네', '먹는', '먹을', '먹으면', '먹니', '먹죠',
+            '먹어요', '하시', '하셔', '하신', '하실', '하시면', '하시니', '하시죠',
+            '는데', '은데', '인데', '거야', '거예요', '거다', '거네', '거네요',
+            '거나', '거나요', '거는', '거는데', '거니', '거니요', '거죠', '거세요',
+            '하셨', '하셔', '하셨어', '하시길', '하시길요', '하시길요',
+            '재밋', '재밌', '재밋습', '재밌습', '재밋니', '재밌니',
+            '시길', '시길요', '시길요요', '시길요요요',
+            '맛담배', '담배하', '고생하', '화이팅해', '저도하고',
+        )
         
         # 한글 어미/접미사 패턴 (중복 제거)
         suffix_patterns = {
@@ -185,25 +275,66 @@ class AICommentGenerator:
             if word in suffix_patterns:
                 return True
             
-            # 2-3글자 단어가 어미로 끝나는 경우 (의미 있는 단어가 아닌 경우)
-            if len(word) <= 3:
+            # 어미 패턴으로 시작하거나 끝나는 경우
+            suffix_start_patterns = ['입니', '습니', '시다', '게맞', '게되', '게하', '게되', '게만', '게는', '게이', '게가']
+            if word.startswith(tuple(suffix_start_patterns)):
+                return True
+            
+            # 2-4글자 단어가 어미로 끝나는 경우 (의미 있는 단어가 아닌 경우)
+            if len(word) <= 4:
                 # 일반적인 어미 종결어미
-                suffix_endings = ['요', '네', '나', '어', '아', '에', '예', '세', '데', '죠', '까', '래', '게', '지', '군', '구', '걸', '라', '러', '로', '루', '르']
+                suffix_endings = ['요', '네', '나', '어', '아', '에', '예', '세', '데', '죠', '까', '래', '게', '지', '군', '구', '걸', '라', '러', '로', '루', '르', '니', '다', '맞']
                 if word[-1] in suffix_endings:
                     # 2글자이고 어미로 끝나는 경우
                     if len(word) == 2:
                         return True
-                    # 3글자이고 일반적인 어미 패턴인 경우
-                    if len(word) == 3 and word[-2:] in ['네요', '나요', '어요', '아요', '에요', '예요', '세요', '는데', '은데', '인데', '는군', '는구', '는걸', '는지', '을까', '을래', '을게']:
-                        return True
+                    # 3-4글자이고 일반적인 어미 패턴인 경우
+                    if len(word) >= 3:
+                        # 3글자 어미 패턴
+                        if word[-2:] in ['네요', '나요', '어요', '아요', '에요', '예요', '세요', '는데', '은데', '인데', '는군', '는구', '는걸', '는지', '을까', '을래', '을게', '입니', '습니', '시다', '게맞']:
+                            return True
+                        # 4글자 어미 패턴
+                        if len(word) == 4 and word[-3:] in ['입니다', '습니다', '게맞다', '게되다', '게하다']:
+                            return True
             
             return False
         
         # 빈도수 높은 키워드 추출 (최소 2번 이상 나온 단어, 제외 단어 및 어미 제외)
-        keywords = [
-            word for word, count in word_counter.most_common(20)
-            if count >= 2 and word not in exclude_words and len(word) >= 2 and not is_suffix(word)
-        ]
+        keywords = []
+        for word, count in word_counter.most_common(30):  # 더 많이 확인
+            # 기본 조건 체크
+            if count < 2 or word in exclude_words or len(word) < 2:
+                continue
+            
+            # 어미로 끝나는지 체크
+            if word.endswith(exclude_endings):
+                continue
+            
+            # 어미로 시작하는 패턴 체크 (입니, 습니, 시다 등) - 강화
+            if word.startswith(('입니', '습니', '시다', '게맞', '게되', '게하', '시길', '하셨', '하셔', '재밋', '재밌')):
+                continue
+            
+            # 어미로 끝나는 패턴 체크 - 강화
+            if word.endswith(('하셨', '하셔', '하셨어', '시길', '시길요', '재밋', '재밌', '재밋습', '재밌습', '재밋니', '재밌니')):
+                continue
+            
+            # 최대 길이 제한 (4글자)
+            if len(word) > 4:
+                continue
+            
+            # is_suffix 함수로 체크
+            if is_suffix(word):
+                continue
+            
+            # 조사로 시작하거나 끝나는지 체크
+            if word.startswith(('은', '는', '이', '가', '을', '를', '의', '에', '에서', '와', '과', '도', '만')):
+                continue
+            if word.endswith(('은', '는', '이', '가', '을', '를', '의', '에', '에서', '와', '과', '도', '만')):
+                continue
+            
+            keywords.append(word)
+            if len(keywords) >= 10:  # 최대 10개
+                break
         
         # 중복 제거 (긴 단어가 짧은 단어를 포함하는 경우 긴 단어 우선)
         filtered_keywords = []
@@ -220,8 +351,12 @@ class AICommentGenerator:
         
         return filtered_keywords[:3]  # 상위 3개만 반환
     
-    def _generate_with_actual_comments(self, title: str, content: str, actual_comments: List[str], keywords: List[str] = None) -> Optional[str]:
-        """실제 댓글을 모방하여 댓글 생성"""
+    def _generate_with_actual_comments(self, title: str, content: str, actual_comments: List[str], keywords: List[str] = None, has_few_comments: bool = False) -> Optional[str]:
+        """실제 댓글을 모방하여 댓글 생성
+        
+        Args:
+            has_few_comments: 댓글이 적을 때(3개 이하) True. 본문 분석을 더 강화함.
+        """
         # 실제 댓글 목록 정리
         comments_list = []
         for comment in actual_comments:
@@ -249,10 +384,100 @@ class AICommentGenerator:
         
         # 실제 댓글 예시 (최대 15개)
         examples = comments_list[:15]
-        examples_text = "\n".join([f"{i+1}. {c}" for i, c in enumerate(examples)])
+        
+        # 학습 데이터 활용: 실제 댓글과 함께 모두 고려
+        learned_comments = []
+        if self.learning_analyzer:
+            try:
+                # 유사 게시글 찾기 (유사도가 높은 것만)
+                similar_posts = self.learning_analyzer.find_similar_posts(title, content, top_n=3)
+                
+                # 유사 게시글의 댓글 추가 (유사도가 높은 것만)
+                for similar in similar_posts:
+                    if similar.get('similarity', 0) > 0.3:  # 유사도 30% 이상만
+                        learned_comments.extend(similar['post'].get('comments', [])[:2])
+                
+                # 주제별 댓글 가져오기 (본문과 관련 있는 키워드만)
+                topic_keywords = self.learning_analyzer.extract_topic_keywords(title, content)
+                # 본문에 실제로 나타나는 키워드만 필터링
+                content_lower = content.lower() if content else ""
+                title_lower = title.lower() if title else ""
+                text_lower = f"{title_lower} {content_lower}"
+                
+                filtered_keywords = [kw for kw in topic_keywords if kw in text_lower]
+                
+                if filtered_keywords:
+                    # 실제 댓글이 적을 때는 더 많이, 많을 때는 적게
+                    max_topic_comments = 5 if len(comments_list) <= 3 else 3
+                    topic_comments = self.learning_analyzer.get_topic_comments(filtered_keywords, max_comments=max_topic_comments)
+                    learned_comments.extend(topic_comments)
+                
+                # 중복 제거 및 기존 댓글과 합치기
+                all_comments_set = set(comments_list)
+                for learned_comment in learned_comments:
+                    if learned_comment and learned_comment not in all_comments_set:
+                        # 학습 데이터 댓글이 실제 댓글과 너무 유사하지 않은 경우만 추가
+                        is_too_similar = False
+                        for actual_comment in comments_list:
+                            # 유사도 체크 (간단한 포함 관계)
+                            if learned_comment in actual_comment or actual_comment in learned_comment:
+                                is_too_similar = True
+                                break
+                        
+                        if not is_too_similar:
+                            examples.append(learned_comment)
+                            all_comments_set.add(learned_comment)
+                            # 실제 댓글이 많을 때는 학습 데이터를 적게, 적을 때는 많이
+                            max_total = 20 if len(comments_list) <= 3 else 18
+                            if len(examples) >= max_total:
+                                break
+                
+                if learned_comments:
+                    logger.debug(f"학습 데이터에서 {len(learned_comments)}개 댓글 추가됨 (실제 댓글과 함께 고려)")
+            except Exception as e:
+                logger.error(f"학습 데이터 활용 오류: {e}")
+        
+        # 실제 댓글과 학습 데이터 댓글 구분하여 표시
+        actual_comments_text = "\n".join([f"{i+1}. {c}" for i, c in enumerate(comments_list[:15])])
+        
+        # 학습 데이터 댓글이 있으면 별도로 표시
+        learned_comments_text = ""
+        learned_examples = [c for c in examples if c not in comments_list[:15]]
+        if learned_examples:
+            learned_comments_text = "\n\n**📚 학습 데이터 댓글 (추가 참고 자료, 실제 댓글과 함께 고려!):**\n"
+            learned_comments_text += "\n".join([f"  - {c}" for c in learned_examples[:8]])
+            learned_comments_text += "\n⚠️ **참고**: 위 학습 데이터 댓글들은 과거 유사한 게시글의 댓글들입니다. 실제 댓글과 함께 참고하여 자연스러운 댓글을 작성하세요!"
+        
+        examples_text = actual_comments_text + learned_comments_text
         
         # 평균 길이 계산 (최대 10글자로 제한)
         avg_len = min(sum(len(c) for c in comments_list) // len(comments_list) if comments_list else 10, 10)
+        
+        # 본문에서 사용한 중요한 용어/숫자 추출 (일치성 강화용)
+        important_terms = []
+        if content:
+            import re
+            # 숫자 추출 (예: "20분", "300포" 등)
+            numbers = re.findall(r'\d+[가-힣]+|\d+분|\d+포|\d+만|\d+천', content)
+            if numbers:
+                important_terms.extend(numbers)
+            
+            # 커뮤니티 특수 용어 추출 (예: "담타", "렉카", "포전" 등)
+            special_terms = ['담타', '렉카', '포전', '포바', '단포바', '깊전', '댓노', '멘징', 
+                           '골스', '오클', '느바', '크보', '믈브', '해축', '새축', '일야',
+                           '담배', '쌈배', '맛담', '맛점', '맛저', '맛아', '맛커']
+            for term in special_terms:
+                if term in content and term not in important_terms:
+                    important_terms.append(term)
+        
+        # 본문 용어/숫자 지시 추가
+        terms_instruction = ""
+        if important_terms:
+            terms_instruction = f"\n\n🚨 **본문에서 사용한 용어/숫자 (반드시 댓글에도 동일하게 사용!):**\n"
+            terms_instruction += f"본문에 다음 용어/숫자가 있습니다: **{', '.join(set(important_terms[:5]))}**\n"
+            terms_instruction += "⚠️ **절대 중요**: 댓글을 작성할 때 이 용어/숫자를 **그대로 사용**하거나 **포함**하세요!\n"
+            terms_instruction += "- 예: 본문에 '담타'가 있으면 댓글도 '담타' 사용 (❌ '담배'로 바꾸지 마세요!)\n"
+            terms_instruction += "- 예: 본문에 '20분'이 있으면 댓글도 '20분' 포함 (❌ '분'만 언급하지 마세요!)\n"
         
         # 게시글 제목과 본문 정보 구성
         post_context = ""
@@ -261,10 +486,45 @@ class AICommentGenerator:
             if title:
                 post_context += f"제목: {title}\n"
             if content:
-                # 본문은 최대 200자로 제한 (너무 길면 맥락 파악이 어려움)
-                content_preview = content[:200] + ("..." if len(content) > 200 else "")
-                post_context += f"본문: {content_preview}\n"
-            post_context += "\n⚠️ **중요**: 위 게시글의 맥락을 이해하고, 실제 댓글들의 스타일을 유지하면서 게시글 내용과 관련된 댓글을 작성하세요!"
+                # 댓글이 적을 때는 본문을 더 길게 제공 (맥락 이해 강화)
+                if has_few_comments:
+                    # 댓글이 적을 때는 본문 전체 또는 최대 500자까지 제공
+                    content_preview = content[:500] + ("..." if len(content) > 500 else "")
+                    post_context += f"본문: {content_preview}\n"
+                    post_context += "\n🚨 **매우 중요 (댓글이 적은 게시글)**:\n"
+                    post_context += "1. 위 게시글의 **전체 맥락과 의미**를 완전히 이해하세요!\n"
+                    post_context += "2. 게시글 작성자가 **무엇을 말하고 있는지**, **어떤 상황인지** 파악하세요!\n"
+                    post_context += "3. 단순히 키워드만 반복하지 마세요! (예: '헤비합니다'라는 본문에 '헤비요!' 같은 단순 반복 금지)\n"
+                    post_context += "4. 게시글의 **의도와 맥락을 이해한 후** 그에 맞는 **공감이나 의견**을 표현하세요!\n"
+                    post_context += "5. 예시:\n"
+                    post_context += "   - 본문: '고기만이나 혼합은 레알 헤비합니다' → ❌ '헤비요!' (단순 반복)\n"
+                    post_context += "   - 본문: '고기만이나 혼합은 레알 헤비합니다' → ✅ '그렇죠 헤비하죠' 또는 '헤비하긴 하네요' (맥락 이해 + 공감)\n"
+                    post_context += "6. 실제 댓글 스타일을 유지하되, 게시글 맥락에 맞는 **의미 있는 댓글**을 작성하세요!"
+                else:
+                    # 댓글이 많을 때는 기존대로 200자로 제한
+                    content_preview = content[:200] + ("..." if len(content) > 200 else "")
+                    post_context += f"본문: {content_preview}\n"
+                    post_context += "\n⚠️ **중요**: 위 게시글의 맥락을 이해하고, 실제 댓글들의 스타일을 유지하면서 게시글 내용과 관련된 댓글을 작성하세요!"
+            
+            # 본문과 댓글 일치성 강화 지시 추가
+            post_context += "\n\n🚨 **본문과 댓글 내용 일치성 (절대 중요!)**:\n"
+            post_context += "1. **용어 일관성**: 본문에서 사용한 용어를 댓글에서도 **동일하게** 사용하세요!\n"
+            post_context += "   - 예: 본문에 '담타'가 있으면 댓글도 '담타' 사용 (❌ '담배' 사용 금지)\n"
+            post_context += "   - 예: 본문에 '렉카'가 있으면 댓글도 '렉카' 관련 표현 사용\n"
+            post_context += "   - 예: 본문에 '석살이'가 있으면 댓글도 '석살이' 또는 '석사' 관련 표현 사용 (❌ '페이백'만 언급 금지)\n"
+            post_context += "2. **숫자/구체적 정보 보존**: 본문의 숫자나 구체적 정보를 댓글에도 포함하세요!\n"
+            post_context += "   - 예: 본문에 '20분'이 있으면 댓글도 '20분' 포함 (❌ '분'만 언급 금지)\n"
+            post_context += "3. **주제 일치성**: 본문의 주제와 실제 댓글의 주제가 다를 때, **본문과 관련 있는 댓글**을 우선 선택하세요!\n"
+            post_context += "   - 예: 본문이 '렉'에 대한 불만이면, 실제 댓글 중 '렉카야 안돼' 같은 본문 관련 댓글 선택\n"
+            post_context += "   - 예: 본문과 관련 없는 일반적인 댓글(예: '아프지마라')은 피하세요!\n"
+            post_context += "4. **본문 맥락 우선**: 실제 댓글이 본문과 관련이 없어 보여도, **반드시 본문의 맥락에 맞는** 댓글을 작성하세요!\n"
+            post_context += "5. **🚫 실제 댓글 단순 복사 금지**: 실제 댓글을 그대로 복사하지 말고, 본문 맥락에 맞게 **새로운 댓글**을 작성하세요!\n"
+            post_context += "6. **🚨 추천 요청에 대한 답변 (절대 중요!)**:\n"
+            post_context += "   - 본문이 '추천해주세요', '추천있나요' 같은 추천을 요청하는 경우:\n"
+            post_context += "     ❌ **절대 금지**: '추천드려요', '추천해요', '추천해드려요' 같은 모호한 댓글 작성!\n"
+            post_context += "     ✅ **필수**: 구체적인 제품명이나 명확한 추천을 포함하거나, 실제 댓글 스타일을 따라 다른 표현 사용!\n"
+            post_context += "     - 예: 본문 '스피커 추천해주세요' → ❌ '꿀템 추천드려요!' (모호함)\n"
+            post_context += "     - 예: 본문 '스피커 추천해주세요' → ✅ '꿀템 사시길' 또는 '가성비는 MR4 좋음' (구체적 또는 실제 댓글 스타일)"
         
         # 커뮤니티 용어 사전 (맥락 이해용)
         community_terms = """
@@ -360,24 +620,43 @@ class AICommentGenerator:
 
 {post_context}
 
-**실제 댓글 예시 (반드시 참고!):**
-{examples_text}
+**🚨 이 게시글에 실제로 달린 댓글들 (최우선 참고!):**
+{actual_comments_text if 'actual_comments_text' in locals() else examples_text}
+{learned_comments_text if 'learned_comments_text' in locals() and learned_comments_text else ''}
 {keyword_text}
+{terms_instruction}
 
 **절대 지켜야 할 규칙:**
-1. **게시글 맥락 이해**: 위 게시글의 제목과 본문을 읽고 게시글의 주제와 내용을 파악하세요
-2. **실제 댓글 스타일 모방**: 위 실제 댓글들의 길이, 스타일, 표현을 거의 동일하게 따라쓰세요
-3. **맥락에 맞는 댓글**: 게시글 내용과 관련된 댓글을 작성하되, 실제 댓글들의 스타일을 유지하세요
-4. **🚨 최대 길이 제한: 반드시 10글자 이내로 작성하세요! (공백, 특수문자 포함)**
-5. 실제 댓글에서 사용된 표현, 어미, 감탄사, 특수문자를 **그대로 사용**하세요
-6. **🔑 키워드 필수 포함**: 위에서 추출한 키워드 중 **오직 하나만** 선택해서 댓글에 포함하세요! (여러 키워드를 동시에 사용하면 안 됩니다!)
-7. **🚫 절대 금지: 새로운 내용을 추가하거나 글을 늘어뜨리지 마세요**
-8. **🚫 절대 금지: "좋아요", "맞아요", "수고하셨어요", "공감합니다", "좋은 정보네요" 등 일반적인 표현 금지**
-9. 위 실제 댓글 예시 중 하나를 **거의 그대로** 따라쓰되, 게시글 맥락에 맞게 약간의 변형만 주세요
-10. **🚫 절대 금지: 영어 사용 금지**
-11. **🚫 절대 금지: 이모티콘 사용 금지**
-12. **반드시 한글로만 작성하세요**
-13. 실제 댓글처럼 짧고 간결하게 작성하세요 (10글자 이내!)
+1. **게시글 맥락 완전 이해**: 위 게시글의 제목과 본문을 **완전히 읽고 이해**하세요. 게시글 작성자가 무엇을 말하고 있는지, 어떤 상황인지 파악하세요
+2. **실제 댓글과 학습 데이터 모두 고려**: 
+   - **실제 댓글**을 최우선으로 참고하되, **학습 데이터 댓글**도 함께 고려하세요!
+   - 실제 댓글의 스타일을 주로 따르되, 학습 데이터의 자연스러운 표현도 참고하세요!
+   - 두 가지를 융합하여 게시글 맥락에 맞는 댓글을 작성하세요!
+3. **댓글 스타일 모방**: 위 실제 댓글들과 학습 데이터 댓글들의 길이, 스타일, 표현을 참고하여 자연스러운 댓글을 작성하세요
+3. **맥락에 맞는 의미 있는 댓글**: 
+   - ❌ **절대 금지**: 단순히 본문의 키워드만 반복 (예: 본문에 "헤비합니다" → "헤비요!" 같은 단순 반복)
+   - ✅ **필수**: 게시글의 맥락을 이해한 후 그에 맞는 **공감이나 의견**을 표현 (예: "그렇죠 헤비하죠", "헤비하긴 하네요")
+   - 게시글 내용과 관련된 **의미 있는 댓글**을 작성하되, 실제 댓글들의 스타일을 유지하세요
+4. **🚨 본문과 댓글 내용 일치성 (절대 중요!)**: 
+   - **용어 일관성**: 본문에서 사용한 용어를 댓글에서도 **동일하게** 사용하세요!
+     - 예: 본문에 "담타"가 있으면 댓글도 "담타" 사용 (❌ "담배" 사용 금지)
+     - 예: 본문에 "렉카"가 있으면 댓글도 "렉카" 관련 표현 사용
+   - **숫자/구체적 정보 보존**: 본문의 숫자나 구체적 정보를 댓글에도 포함하세요!
+     - 예: 본문에 "20분"이 있으면 댓글도 "20분" 포함 (❌ "분"만 언급 금지)
+   - **주제 일치성**: 본문의 주제와 실제 댓글의 주제가 다를 때, **본문과 관련 있는 댓글**을 우선 선택하세요!
+     - 예: 본문이 "렉"에 대한 불만이면, 실제 댓글 중 "렉카야 안돼" 같은 본문 관련 댓글 선택
+     - 예: 본문과 관련 없는 일반적인 댓글(예: "아프지마라")은 피하세요!
+5. **🚨 최대 길이 제한: 반드시 10글자 이내로 작성하세요! (공백, 특수문자 포함)**
+6. 실제 댓글에서 사용된 표현, 어미, 감탄사, 특수문자를 **그대로 사용**하세요
+7. **🔑 키워드 포함**: 위에서 추출한 키워드가 있으면 포함하되, **단순 반복이 아닌 맥락에 맞게** 사용하세요
+8. **🚫 절대 금지: 새로운 내용을 추가하거나 글을 늘어뜨리지 마세요**
+9. **🚫 절대 금지: "좋아요", "맞아요", "수고하셨어요", "공감합니다", "좋은 정보네요" 등 일반적인 표현 금지**
+10. 위 실제 댓글 예시 중 하나를 **거의 그대로** 따라쓰되, 게시글 맥락에 맞게 약간의 변형만 주세요
+11. **🚫 절대 금지: 영어 사용 금지**
+12. **🚫 절대 금지: 이모티콘 사용 금지**
+13. **반드시 한글로만 작성하세요**
+14. 실제 댓글처럼 짧고 간결하게 작성하세요 (10글자 이내!)
+15. **🚨 댓글이 적은 게시글 특별 주의**: 댓글이 적을 때는 본문을 더 자세히 분석하고, 단순 키워드 반복이 아닌 **게시글의 의도를 이해한 댓글**을 작성하세요!
 
 **예시:**
 - 게시글: "치킨 먹고 싶다" / 실제 댓글: "맛담요~" → 생성: "맛담요..!" 또는 "맛담요!" (맥락에 맞고 스타일 유지)
@@ -392,29 +671,55 @@ class AICommentGenerator:
 **📄 게시글 정보 (맥락 파악):**
 {post_context if post_context else "게시글 정보 없음"}
 
-**🚨 이 게시글에 실제로 달린 댓글들 (스타일을 따라쓰세요!):**
-{examples_text}
+**🚨 이 게시글에 실제로 달린 댓글들 (최우선 참고!):**
+{actual_comments_text if 'actual_comments_text' in locals() else examples_text}
+{learned_comments_text if 'learned_comments_text' in locals() and learned_comments_text else ''}
 {keyword_text}
+{terms_instruction}
 
 **🚨 반드시 지켜야 할 규칙:**
-1. **게시글 맥락 이해**: 위 게시글의 제목과 본문을 읽고 게시글의 주제와 내용을 파악하세요
-2. **실제 댓글 스타일 모방**: 위 실제 댓글들의 길이, 스타일, 표현을 거의 동일하게 따라쓰세요
-3. **맥락에 맞는 댓글**: 게시글 내용과 관련된 댓글을 작성하되, 실제 댓글들의 스타일을 유지하세요
-4. **🚨 최대 길이 제한: 반드시 10글자 이내로 작성하세요! (공백, 특수문자 포함)**
-5. **⚠️ 문장 완성도: 반드시 문장을 완전히 마무리하세요! 말이 끊기면 안 됩니다!**
+1. **게시글 맥락 완전 이해**: 위 게시글의 제목과 본문을 **완전히 읽고 이해**하세요. 게시글 작성자가 무엇을 말하고 있는지, 어떤 상황인지 파악하세요
+2. **실제 댓글과 학습 데이터 모두 고려**: 
+   - **실제 댓글**을 최우선으로 참고하되, **학습 데이터 댓글**도 함께 고려하세요!
+   - 실제 댓글의 스타일을 주로 따르되, 학습 데이터의 자연스러운 표현도 참고하세요!
+   - 두 가지를 융합하여 게시글 맥락에 맞는 댓글을 작성하세요!
+3. **댓글 스타일 모방**: 위 실제 댓글들과 학습 데이터 댓글들의 길이, 스타일, 표현을 참고하여 자연스러운 댓글을 작성하세요
+3. **맥락에 맞는 의미 있는 댓글**: 
+   - ❌ **절대 금지**: 단순히 본문의 키워드만 반복 (예: 본문에 "헤비합니다" → "헤비요!" 같은 단순 반복)
+   - ✅ **필수**: 게시글의 맥락을 이해한 후 그에 맞는 **공감이나 의견**을 표현 (예: "그렇죠 헤비하죠", "헤비하긴 하네요")
+   - 게시글 내용과 관련된 **의미 있는 댓글**을 작성하되, 실제 댓글들의 스타일을 유지하세요
+4. **🚨 본문과 댓글 내용 일치성 (절대 중요!)**: 
+   - **용어 일관성**: 본문에서 사용한 용어를 댓글에서도 **동일하게** 사용하세요!
+     - 예: 본문에 "담타"가 있으면 댓글도 "담타" 사용 (❌ "담배" 사용 금지)
+     - 예: 본문에 "렉카"가 있으면 댓글도 "렉카" 관련 표현 사용
+   - **숫자/구체적 정보 보존**: 본문의 숫자나 구체적 정보를 댓글에도 포함하세요!
+     - 예: 본문에 "20분"이 있으면 댓글도 "20분" 포함 (❌ "분"만 언급 금지)
+   - **주제 일치성**: 본문의 주제와 실제 댓글의 주제가 다를 때, **본문과 관련 있는 댓글**을 우선 선택하세요!
+     - 예: 본문이 "렉"에 대한 불만이면, 실제 댓글 중 "렉카야 안돼" 같은 본문 관련 댓글 선택
+     - 예: 본문과 관련 없는 일반적인 댓글(예: "아프지마라")은 피하세요!
+   - **🚨 추천 요청에 대한 답변 (절대 중요!)**: 본문이 "추천해주세요", "추천있나요" 같은 추천을 요청하는 경우:
+     - ❌ **절대 금지**: "추천드려요", "추천해요", "추천해드려요" 같은 모호한 댓글 작성!
+     - ✅ **필수**: 구체적인 제품명이나 명확한 추천을 포함하거나, 실제 댓글 스타일을 따라 다른 표현 사용!
+     - 예: 본문 "스피커 추천해주세요" → ❌ "꿀템 추천드려요!" (모호함)
+     - 예: 본문 "스피커 추천해주세요" → ✅ "꿀템 사시길" 또는 "가성비는 MR4 좋음" (구체적 또는 실제 댓글 스타일)
+5. **🚨 최대 길이 제한: 반드시 10글자 이내로 작성하세요! (공백, 특수문자 포함)**
+6. **⚠️ 문장 완성도: 반드시 문장을 완전히 마무리하세요! 말이 끊기면 안 됩니다!**
    - ❌ 잘못된 예: "추워요 감기조심하세" (10글자지만 말이 끊김)
    - ✅ 올바른 예: "추워요 감기조심하세요" (10글자, 문장 완성)
    - ✅ 올바른 예: "감기조심하세요" (7글자, 문장 완성)
    - ✅ 올바른 예: "추워요 조심하세요" (8글자, 문장 완성)
-6. 실제 댓글에서 사용된 표현, 어미, 감탄사, 특수문자를 **그대로 사용**하세요
-7. **🔑 키워드 필수 포함**: 위에서 추출한 키워드 중 **오직 하나만** 선택해서 댓글에 포함하세요! (여러 키워드를 동시에 사용하면 안 됩니다!)
-8. **🚫 절대 금지: 새로운 내용을 추가하거나 글을 늘어뜨리지 마세요**
-9. **🚫 절대 금지: "좋아요", "맞아요", "수고하셨어요", "공감합니다", "좋은 정보네요" 등 일반적인 표현 금지**
-10. 위 실제 댓글 예시 중 하나를 **거의 그대로** 따라쓰되, 게시글 맥락에 맞게 약간의 변형만 주세요
-11. **🚫 절대 금지: 영어 사용 금지**
-12. **🚫 절대 금지: 이모티콘 사용 금지**
-13. **반드시 한글로만 작성하세요**
-14. 실제 댓글처럼 짧고 간결하게 작성하세요 (10글자 이내, 문장 완성 필수!)
+7. 실제 댓글에서 사용된 표현, 어미, 감탄사, 특수문자를 **그대로 사용**하세요
+8. **🔑 키워드 포함**: 위에서 추출한 키워드가 있으면 포함하되, **단순 반복이 아닌 맥락에 맞게** 사용하세요
+9. **🚫 절대 금지: 새로운 내용을 추가하거나 글을 늘어뜨리지 마세요**
+10. **🚫 절대 금지: "좋아요", "맞아요", "수고하셨어요", "공감합니다", "좋은 정보네요" 등 일반적인 표현 금지**
+11. 위 실제 댓글 예시 중 하나를 **거의 그대로** 따라쓰되, 게시글 맥락에 맞게 약간의 변형만 주세요
+12. **🚫 절대 금지: 영어 사용 금지**
+13. **🚫 절대 금지: 이모티콘 사용 금지**
+14. **반드시 한글로만 작성하세요**
+15. 실제 댓글처럼 짧고 간결하게 작성하세요 (10글자 이내, 문장 완성 필수!)
+16. **🚨 댓글이 적은 게시글 특별 주의**: 댓글이 적을 때는 본문을 더 자세히 분석하고, 단순 키워드 반복이 아닌 **게시글의 의도를 이해한 댓글**을 작성하세요!
+17. **🚫 실제 댓글 단순 복사 금지**: 실제 댓글을 그대로 복사하지 말고, 본문 맥락에 맞게 **새로운 댓글**을 작성하세요!
+18. **⚠️ 문장 완성도 필수**: 댓글이 불완전하게 끊기지 않도록 완전한 문장으로 작성하세요! (예: ❌ "무한도전 보니까 웃" → ✅ "무한도전 재밌네요" 또는 "무한도전 보니까 웃겨요")
 
 **예시:**
 - 게시글: "치킨 먹고 싶다" / 실제 댓글: "맛담요~" → 생성: "맛담요..!" 또는 "맛담요!" (맥락에 맞고 스타일 유지)
@@ -506,6 +811,60 @@ class AICommentGenerator:
         if not has_korean:
             logger.warning(f"한글이 없어서 필터링: '{comment}'")
             return None
+        
+        # 불완전한 댓글 검증 (끝이 어색하게 끊기는 경우)
+        incomplete_patterns = [
+            r'보니까\s*웃$',  # "보니까 웃"
+            r'보니\s*웃$',    # "보니 웃"
+            r'보고\s*웃$',    # "보고 웃"
+            r'\.\.\.$',       # "..."
+            r'\.\.$',         # ".."
+            r'\.$',           # "." (단독)
+        ]
+        for pattern in incomplete_patterns:
+            if re.search(pattern, comment):
+                logger.warning(f"불완전한 댓글 패턴 감지: '{comment}'")
+                return None
+        
+        # 문장이 너무 짧거나 의미 없는 경우 (1-2글자)
+        if len(comment.strip()) <= 2:
+            logger.warning(f"너무 짧은 댓글: '{comment}'")
+            return None
+        
+        # 본문이 추천을 요청하는데 댓글이 모호한 경우 필터링
+        if hasattr(self, '_current_post_content') and self._current_post_content:
+            post_text = (self._current_post_title or "") + " " + (self._current_post_content or "")
+            # 본문에 "추천" 관련 질문이 있는지 확인
+            has_recommendation_request = bool(re.search(r'추천|추천해|추천해주|추천해줘|추천있|추천해요|추천해주세요', post_text))
+            
+            if has_recommendation_request:
+                # 댓글이 "추천드려요", "추천해요", "추천해드려요" 같은 모호한 표현만 있는지 확인
+                vague_recommendation_patterns = [
+                    r'추천드려요',
+                    r'추천해요',
+                    r'추천해드려요',
+                    r'추천드립니다',
+                    r'추천해드립니다',
+                    r'추천해줄게',
+                    r'추천해줄게요',
+                ]
+                
+                # 댓글에 구체적인 제품명이나 명확한 추천이 있는지 확인
+                has_specific_recommendation = bool(re.search(
+                    r'[A-Za-z0-9]+|사시길|사세요|사봐|사보세요|사보시길|사보시죠|사보시길요|사보시길요요',
+                    comment
+                ))
+                
+                # 모호한 추천 표현만 있고 구체적인 추천이 없는 경우 필터링
+                is_vague_only = False
+                for pattern in vague_recommendation_patterns:
+                    if re.search(pattern, comment):
+                        is_vague_only = True
+                        break
+                
+                if is_vague_only and not has_specific_recommendation:
+                    logger.warning(f"본문이 추천을 요청하는데 모호한 댓글만 생성됨: '{comment}' (필터링)")
+                    return None
         
         # 10글자 이내로 제한 (문장 완성도 확인)
         if len(comment) > 10:

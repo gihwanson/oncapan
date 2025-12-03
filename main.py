@@ -300,7 +300,7 @@ def main():
         root.deiconify()
         root.focus_force()
         
-        app = MacroGUI(root, force_test_mode=True)
+        app = MacroGUI(root, force_test_mode=False)
         root.mainloop()
     except Exception as e:
         import traceback

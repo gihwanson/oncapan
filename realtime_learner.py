@@ -7,6 +7,7 @@
 
 import json
 import os
+import sys
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -14,12 +15,55 @@ from typing import List, Dict, Optional
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 학습 분석기 import (순환 참조 방지)
+try:
+    from learning_analyzer import LearningAnalyzer
+    HAS_LEARNING_ANALYZER = True
+except ImportError:
+    HAS_LEARNING_ANALYZER = False
+    logger.warning("LearningAnalyzer를 import할 수 없습니다. 학습 기능이 제한됩니다.")
+
 class RealtimeLearner:
-    def __init__(self, log_file="learning_log.txt", comments_file="collected_comments.json"):
-        self.log_file = log_file
-        self.comments_file = comments_file
-        self.learning_data_file = "realtime_learning_data.json"
+    def __init__(self, log_file=None, comments_file=None):
+        # 영구 저장 위치 설정 (빌드 후에도 학습 데이터 보존)
+        if getattr(sys, 'frozen', False):
+            # PyInstaller로 빌드된 exe 실행 시
+            base_path = os.path.dirname(sys.executable)
+        else:
+            # 스크립트 실행 시
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        
+        # 사용자 홈 디렉토리에 저장 (영구 보존)
+        user_home = os.path.expanduser('~')
+        app_data_dir = os.path.join(user_home, 'oncapan_learning')
+        
+        # 디렉토리 생성 (없으면)
+        try:
+            os.makedirs(app_data_dir, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"학습 데이터 디렉토리 생성 실패, 현재 디렉토리 사용: {e}")
+            app_data_dir = base_path
+        
+        # 파일 경로 설정
+        if log_file is None:
+            self.log_file = os.path.join(app_data_dir, "learning_log.txt")
+        else:
+            self.log_file = log_file
+        
+        if comments_file is None:
+            self.comments_file = os.path.join(app_data_dir, "collected_comments.json")
+        else:
+            self.comments_file = comments_file
+        
+        self.learning_data_file = os.path.join(app_data_dir, "realtime_learning_data.json")
         self.processed_posts = []  # 처리한 게시글 목록
+        
+        # 학습 분석기 초기화 (같은 디렉토리 사용)
+        if HAS_LEARNING_ANALYZER:
+            learning_data_file = os.path.join(app_data_dir, "learning_data.json")
+            self.learning_analyzer = LearningAnalyzer(learning_data_file=learning_data_file, log_file=self.log_file)
+        else:
+            self.learning_analyzer = None
         
         # 로그 파일 초기화
         self._init_log_file()
@@ -118,9 +162,24 @@ class RealtimeLearner:
             # 또는 <textarea id="save_comment_숫자"> 에도 저장되어 있음
             
             # 방법 1: section#bo_vc 안의 article 태그에서 댓글 찾기 (우선)
+            # 대댓글 제외: 부모 article 내부에 중첩된 article은 제외
             bo_vc = soup.find('section', id='bo_vc')
             if bo_vc:
-                comment_articles = bo_vc.find_all('article', id=lambda x: x and x.startswith('c_'))
+                all_articles = bo_vc.find_all('article', id=lambda x: x and x.startswith('c_'))
+                # 대댓글 제외: 다른 article 내부에 있는 article은 대댓글로 간주
+                comment_articles = []
+                for article in all_articles:
+                    # 부모 요소를 확인하여 다른 article 내부에 있는지 체크
+                    parent = article.parent
+                    is_nested = False
+                    while parent and parent.name != 'section':
+                        if parent.name == 'article':
+                            is_nested = True
+                            break
+                        parent = parent.parent
+                    # 최상위 댓글만 포함 (대댓글 제외)
+                    if not is_nested:
+                        comment_articles.append(article)
             else:
                 comment_articles = []
             
@@ -365,7 +424,7 @@ class RealtimeLearner:
     def log_post_processing(self, post_title: str, post_content: str, 
                             actual_comments: List[str], ai_comment: Optional[str],
                             post_url: str = ""):
-        """게시글 처리 로그 기록"""
+        """게시글 처리 로그 기록 및 즉시 학습"""
         try:
             with open(self.log_file, 'a', encoding='utf-8') as f:
                 f.write("\n" + "=" * 80 + "\n")
@@ -390,6 +449,26 @@ class RealtimeLearner:
                 else:
                     f.write("AI 생성 댓글: 생성 실패\n")
                 f.write("=" * 80 + "\n\n")
+            
+            # 즉시 학습: 주제별 댓글 통계 업데이트
+            if self.learning_analyzer and actual_comments:
+                try:
+                    self.learning_analyzer.update_topic_statistics(
+                        post_title, post_content, actual_comments
+                    )
+                    logger.debug(f"즉시 학습 완료: {post_title[:30]}...")
+                except Exception as e:
+                    logger.error(f"즉시 학습 오류: {e}")
+            
+            # 배치 학습: 매 50개 게시글 처리 후 로그 분석
+            if self.learning_analyzer:
+                total_processed = self.learning_analyzer.learning_data.get('total_processed', 0)
+                if total_processed > 0 and total_processed % 50 == 0:
+                    try:
+                        self.learning_analyzer.analyze_log_file(batch_size=50)
+                        logger.info(f"배치 학습 완료: {total_processed}개 게시글 처리됨")
+                    except Exception as e:
+                        logger.error(f"배치 학습 오류: {e}")
                 
         except Exception as e:
             logger.error(f"로그 기록 오류: {e}")

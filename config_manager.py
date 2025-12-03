@@ -30,7 +30,7 @@ class ConfigManager:
     
     def save_config(self, username: str, password: str, api_key: str, 
                    comment_delay: int = 10, min_delay: int = 5, max_delay: int = 15,
-                   auto_collect: bool = False):
+                   auto_collect: bool = False, limit_mode: str = "unlimited", limit_count: int = 1000):
         """설정 저장 (비밀번호와 API 키 암호화)"""
         config = {
             'username': username,
@@ -39,7 +39,9 @@ class ConfigManager:
             'comment_delay': comment_delay,
             'min_delay': min_delay,
             'max_delay': max_delay,
-            'auto_collect': auto_collect
+            'auto_collect': auto_collect,
+            'limit_mode': limit_mode,
+            'limit_count': limit_count
         }
         
         with open(self.config_file, 'w', encoding='utf-8') as f:

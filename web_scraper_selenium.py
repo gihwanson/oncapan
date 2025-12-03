@@ -480,7 +480,7 @@ class OncaPanScraperSelenium:
             return None
     
     def has_commented(self, post_url: str, username: str) -> bool:
-        """이미 댓글을 달았는지 확인"""
+        """이미 댓글을 달았는지 확인 (댓글 작성자 영역만 정확히 확인)"""
         try:
             # 현재 URL 확인 - 이미 해당 게시글 페이지에 있으면 새로고침 안 함
             current_url = self.driver.current_url
@@ -491,20 +491,52 @@ class OncaPanScraperSelenium:
                 time.sleep(0.2)  # 이미 해당 페이지에 있으면 짧은 대기만
             
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-            page_text = soup.get_text()
             
-            # 댓글 영역에서 사용자명 찾기
-            if username in page_text:
-                # 댓글 작성자 영역 확인
-                comments = soup.find_all(['div', 'li'], class_=lambda x: x and 'comment' in x.lower())
-                for comment in comments:
-                    if username in comment.get_text():
+            # 댓글 섹션만 확인 (전체 페이지가 아닌)
+            bo_vc = soup.find('section', id='bo_vc')
+            if not bo_vc:
+                return False
+            
+            # 댓글 article 태그에서 작성자 정보만 확인
+            comment_articles = bo_vc.find_all('article', id=lambda x: x and x.startswith('c_'))
+            
+            for article in comment_articles:
+                # 작성자 정보가 있는 영역 찾기 (일반적으로 작성자명이 있는 div/span)
+                # 여러 패턴 시도
+                author_selectors = [
+                    article.find('div', class_=lambda x: x and ('author' in str(x).lower() or 'writer' in str(x).lower() or 'name' in str(x).lower())),
+                    article.find('span', class_=lambda x: x and ('author' in str(x).lower() or 'writer' in str(x).lower() or 'name' in str(x).lower())),
+                    article.find('strong', class_=lambda x: x and ('author' in str(x).lower() or 'writer' in str(x).lower())),
+                ]
+                
+                for author_elem in author_selectors:
+                    if author_elem and username in author_elem.get_text():
                         return True
+                
+                # 작성자 영역을 찾지 못한 경우, article의 첫 번째 텍스트 노드에서 확인
+                # (일반적으로 댓글 구조에서 작성자명이 먼저 나옴)
+                article_text = article.get_text()
+                # 작성자명이 댓글 내용보다 앞에 있는지 확인
+                if username in article_text:
+                    # username이 포함된 첫 번째 부분만 확인 (댓글 내용이 아닌 작성자 영역)
+                    first_part = article_text[:min(len(article_text), 100)]  # 처음 100자만
+                    if username in first_part:
+                        # 댓글 내용에 username이 포함된 경우는 제외
+                        cmt_contents = article.find('div', class_='cmt_contents')
+                        if cmt_contents:
+                            comment_text = cmt_contents.get_text()
+                            if username not in comment_text:  # 댓글 내용에 없으면 작성자명으로 간주
+                                return True
+                        else:
+                            # cmt_contents가 없으면 첫 부분에 있으면 작성자명으로 간주
+                            return True
             
             return False
             
         except Exception as e:
             logger.error(f"댓글 확인 오류: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return False
     
     def write_comment(self, post_url: str, comment: str) -> bool:

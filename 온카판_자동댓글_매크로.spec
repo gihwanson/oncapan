@@ -229,7 +229,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='온카판_자동댓글_매크로',
+    name='온카판_자동댓글_매크로_v4',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

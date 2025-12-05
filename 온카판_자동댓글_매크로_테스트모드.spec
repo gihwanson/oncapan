@@ -203,7 +203,7 @@ except Exception as e:
 
 
 a = Analysis(
-    ['main.py'],
+    ['main_test.py'],  # 테스트 모드 전용 main 파일 사용
     pathex=[],
     binaries=binaries,
     datas=datas,
@@ -224,7 +224,7 @@ exe = EXE(
     a.zipfiles,  # PyInstaller 기본 템플릿에 맞춰 수정
     a.datas,
     [],
-    name='온카판_자동댓글_매크로_v4',
+    name='온카판_자동댓글_매크로_v4_테스트모드',  # 테스트 모드 전용 이름
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -239,3 +239,5 @@ exe = EXE(
     entitlements_file=None,
     icon=None,
 )
+
+

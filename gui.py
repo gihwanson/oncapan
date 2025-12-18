@@ -130,8 +130,9 @@ class MacroGUI:
         test_frame = ttk.Frame(main_frame)
         test_frame.grid(row=4, column=0, columnspan=2, pady=5)
         
-        self.test_mode_var = tk.BooleanVar(value=self.force_test_mode)
-        test_check = ttk.Checkbutton(test_frame, text="테스트 모드 (실제 댓글 작성 안 함)", variable=self.test_mode_var)
+        # 테스트 모드 기본값: True (안전을 위해)
+        self.test_mode_var = tk.BooleanVar(value=True if not self.force_test_mode else True)
+        test_check = ttk.Checkbutton(test_frame, text="✅ 테스트 모드 (실제 댓글 작성 안 함) - 권장", variable=self.test_mode_var)
         test_check.pack()
         
         # 테스트 모드 강제 활성화인 경우 체크박스 비활성화
@@ -140,6 +141,16 @@ class MacroGUI:
             # 테스트 모드 안내 라벨 추가
             test_label = ttk.Label(test_frame, text="⚠️ 테스트 모드로만 실행됩니다", foreground="orange")
             test_label.pack(pady=(5, 0))
+        
+        # 모드 선택 (매크로 모드 / 학습 모드)
+        mode_frame = ttk.LabelFrame(main_frame, text="실행 모드", padding="10")
+        mode_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        self.mode_var = tk.StringVar(value="macro")
+        ttk.Radiobutton(mode_frame, text="📝 매크로 모드 (댓글 작성)", 
+                       variable=self.mode_var, value="macro").pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(mode_frame, text="📚 학습 모드 (댓글 수집만)", 
+                       variable=self.mode_var, value="learning").pack(side=tk.LEFT, padx=10)
         
         # 버튼 프레임
         button_frame = ttk.Frame(main_frame)
@@ -327,6 +338,14 @@ class MacroGUI:
         self.min_delay_entry.config(state='readonly')
         self.max_delay_entry.config(state='readonly')
         
+        # 모드 선택 활성화
+        for widget in self.root.winfo_children():
+            for child in widget.winfo_children():
+                if isinstance(child, ttk.LabelFrame):
+                    for grandchild in child.winfo_children():
+                        if isinstance(grandchild, ttk.Radiobutton):
+                            grandchild.config(state=tk.NORMAL)
+        
         if self.scraper:
             self.scraper.close()
         
@@ -362,19 +381,19 @@ class MacroGUI:
                     self.root.after(0, partial(self.log, "⚠️ 테스트 모드로 실행됩니다. 실제 댓글은 작성되지 않습니다."))
                 
                 # 로그인 시도
-                self.root.after(0, lambda: self.log("로그인 시도 중..."))
+                self.root.after(0, partial(self.log, "로그인 시도 중..."))
                 if not self.scraper.login(username, password):
                     retry_count += 1
                     if retry_count < max_retries:
-                        self.root.after(0, lambda: self.log(f"로그인 실패. 재시도 중... ({retry_count}/{max_retries})"))
+                        self.root.after(0, partial(self.log, f"로그인 실패. 재시도 중... ({retry_count}/{max_retries})"))
                         time.sleep(5)
                         continue
                     else:
-                        self.root.after(0, lambda: self.log("로그인 실패. 매크로를 중지합니다."))
+                        self.root.after(0, partial(self.log, "로그인 실패. 매크로를 중지합니다."))
                         self.root.after(0, self.stop_macro)
                         return
                 
-                self.root.after(0, lambda: self.log("로그인 성공!"))
+                self.root.after(0, partial(self.log, "로그인 성공!"))
                 retry_count = 0  # 로그인 성공 시 재시도 카운트 리셋
                 
                 # 이미 댓글 단 게시글 추적 (파일로 저장하여 영구 보존)
@@ -391,7 +410,7 @@ class MacroGUI:
                 commented_posts_file = os.path.join(base_path, "commented_posts.json")
                 commented_posts = self._load_commented_posts(commented_posts_file)
                 if commented_posts:
-                    self.root.after(0, lambda: self.log(f"📝 이전 댓글 작성 이력 로드: {len(commented_posts)}개 게시글"))
+                    self.root.after(0, partial(self.log, f"📝 이전 댓글 작성 이력 로드: {len(commented_posts)}개 게시글"))
                 
                 # 댓글 작성 횟수 카운터
                 comment_count = 0
@@ -560,13 +579,16 @@ class MacroGUI:
                                 continue
                             
                             # 3. 키워드 표시 (댓글 생성 전)
-                            if actual_comments:
-                                try:
-                                    keywords = self.ai_generator._extract_keywords(actual_comments)
-                                    if keywords:
-                                        self.root.after(0, partial(self.log, f"🔑 키워드: {', '.join(keywords[:3])}"))
-                                except:
-                                    pass
+                            try:
+                                keywords = self.ai_generator._extract_keywords(
+                                    comments=actual_comments,
+                                    post_title=actual_post_title or "",
+                                    post_content=post_content or ""
+                                )
+                                if keywords:
+                                    self.root.after(0, partial(self.log, f"🔑 키워드: {', '.join(keywords[:8])}"))
+                            except Exception as e:
+                                logger.debug(f"키워드 추출 오류: {e}")
                             
                             # 설정된 대기 시간
                             wait_time = random.uniform(min_delay, max_delay)
@@ -575,11 +597,32 @@ class MacroGUI:
                             # AI 댓글 생성
                             try:
                                 self.root.after(0, partial(self.log, f"🤖 AI 댓글 생성 중..."))
-                                comment = self.ai_generator.generate_comment(post_content, actual_post_title, actual_comments)
+                                comment = self.ai_generator.generate_comment(
+                                    post_content, 
+                                    actual_post_title, 
+                                    actual_comments,
+                                    post_id=post_id  # 게시글별 중복 방지
+                                )
                                 
                                 if not comment:
                                     self.root.after(0, partial(self.log, f"❌ AI 댓글 생성 실패 (댓글 없음 또는 생성 오류)"))
                                     logger.warning(f"AI 댓글 생성 실패: post_title={actual_post_title}, comments_count={len(actual_comments) if actual_comments else 0}")
+                                    # 실패 원인 로깅
+                                    stats = self.ai_generator.get_stats()
+                                    failure_reasons = stats.get('failure_reasons', {})
+                                    if failure_reasons:
+                                        top_failure = max(failure_reasons.items(), key=lambda x: x[1], default=None)
+                                        if top_failure:
+                                            self.root.after(0, partial(self.log, f"   주요 실패 원인: {top_failure[0]} ({top_failure[1]}회)"))
+                                    # 디버그: 생성 시도한 후보 확인 (로그 파일에 기록)
+                                    try:
+                                        debug_log_file = "ai_debug_log.txt"
+                                        with open(debug_log_file, 'a', encoding='utf-8') as f:
+                                            f.write(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 댓글 생성 실패\n")
+                                            f.write(f"게시글: {actual_post_title}\n")
+                                            f.write(f"실패 원인: {top_failure[0] if top_failure else '알 수 없음'}\n\n")
+                                    except:
+                                        pass
                                     continue
                             except Exception as e:
                                 self.root.after(0, partial(self.log, f"❌ AI 댓글 생성 오류: {str(e)}"))
@@ -604,7 +647,27 @@ class MacroGUI:
                                 except Exception as e:
                                     logger.error(f"학습 로그 기록 오류: {e}")
                             
-                            if self.scraper.write_comment(post_url, comment):
+                            # 댓글 작성 시도 (테스트 모드 체크)
+                            write_success = False
+                            write_error = None
+                            
+                            # 테스트 모드 확인
+                            test_mode = getattr(self.scraper, 'test_mode', False) if self.scraper else False
+                            
+                            if test_mode:
+                                # 테스트 모드: 실제 작성하지 않고 시뮬레이션만
+                                write_success = True  # 테스트 모드에서는 성공으로 처리
+                                self.root.after(0, partial(self.log, f"🧪 [테스트 모드] 댓글 작성 시뮬레이션: {comment}"))
+                            else:
+                                try:
+                                    write_success = self.scraper.write_comment(post_url, comment)
+                                    if not write_success:
+                                        write_error = "댓글 작성 실패 (원인 불명)"
+                                except Exception as e:
+                                    write_error = str(e)
+                                    logger.error(f"댓글 작성 예외 발생: {e}", exc_info=True)
+                            
+                            if write_success:
                                 commented_posts.add(post_id)
                                 comment_count += 1
                                 save_counter += 1
@@ -621,6 +684,9 @@ class MacroGUI:
                                     limit_reached = True
                                     # 목표 달성 시 즉시 저장
                                     self._save_commented_posts(commented_posts, commented_posts_file)
+                                    # 통계도 즉시 저장
+                                    if self.ai_generator:
+                                        self.ai_generator.save_stats_now()
                                     self.root.after(0, partial(self.log, f"🎯 목표 횟수 달성: {limit_count}번 작성 완료"))
                                     self.root.after(0, partial(self.log, "매크로를 자동으로 중지합니다."))
                                     break
@@ -630,7 +696,13 @@ class MacroGUI:
                                     status_text += f" / 목표: {limit_count}번"
                                 self.root.after(0, partial(self.status_label.config, text=status_text))
                             else:
-                                self.root.after(0, partial(self.log, f"❌ 댓글 작성 실패"))
+                                # 댓글 작성 실패 상세 로깅
+                                error_msg = f"❌ 댓글 작성 실패"
+                                if write_error:
+                                    error_msg += f": {write_error}"
+                                self.root.after(0, partial(self.log, error_msg))
+                                logger.warning(f"댓글 작성 실패: post_id={post_id}, error={write_error}")
+                                # 실패해도 commented_posts에 추가하지 않음 (재시도 가능)
                             
                             self.root.after(0, partial(self.log, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
                             
@@ -658,7 +730,7 @@ class MacroGUI:
                     
                     # 횟수 제한에 도달했는지 확인
                     if limit_reached:
-                        self.root.after(0, lambda: self.log(f"✅ 목표 횟수 달성: {comment_count}번 작성 완료"))
+                        self.root.after(0, partial(self.log, f"✅ 목표 횟수 달성: {comment_count}번 작성 완료"))
                         self.root.after(0, self.stop_macro)
                         break
                 
@@ -668,10 +740,10 @@ class MacroGUI:
                 self.root.after(0, partial(self.log, error_msg))
                 retry_count += 1
                 if retry_count < max_retries:
-                    self.root.after(0, lambda: self.log(f"재시도 중... ({retry_count}/{max_retries})"))
+                    self.root.after(0, partial(self.log, f"재시도 중... ({retry_count}/{max_retries})"))
                     time.sleep(10)
                 else:
-                    self.root.after(0, lambda: self.log("최대 재시도 횟수 초과. 매크로를 중지합니다."))
+                    self.root.after(0, partial(self.log, "최대 재시도 횟수 초과. 매크로를 중지합니다."))
                     self.root.after(0, self.stop_macro)
                     break
             finally:

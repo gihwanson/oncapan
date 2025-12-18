@@ -13,8 +13,18 @@ if os.path.exists('initial_learning_data.json'):
     datas.append(('initial_learning_data.json', '.'))
     print("초기 학습 데이터 포함: initial_learning_data.json")
 
+# 댓글 풀 파일 추가
+if os.path.exists('comment_pool.json'):
+    datas.append(('comment_pool.json', '.'))
+    print("댓글 풀 파일 포함: comment_pool.json")
+
+# 프롬프트 디렉토리 추가
+if os.path.exists('prompts'):
+    datas.append(('prompts', 'prompts'))
+    print("프롬프트 디렉토리 포함: prompts/")
+
 binaries = []
-hiddenimports = ['tkinter', '_tkinter', 'requests', 'bs4', 'openai', 'cryptography', 'selenium', 'webdriver_manager', 'config_manager', 'realtime_learner']
+hiddenimports = ['tkinter', '_tkinter', 'requests', 'bs4', 'openai', 'cryptography', 'selenium', 'webdriver_manager', 'config_manager', 'realtime_learner', 'ai_comment_generator', 'learning_analyzer']
 
 # tkinter 수집 시도
 try:

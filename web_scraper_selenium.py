@@ -34,21 +34,117 @@ class OncaPanScraperSelenium:
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        # 빠른 시작을 위한 옵션
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--disable-extensions')
+        chrome_options.add_argument('--disable-plugins')
+        chrome_options.add_argument('--disable-images')  # 이미지 로딩 비활성화로 속도 향상
+        chrome_options.add_experimental_option('prefs', {
+            'profile.default_content_setting_values': {
+                'images': 2  # 이미지 차단
+            }
+        })
         
         try:
-            # webdriver-manager 사용 시도
-            try:
-                from selenium.webdriver.chrome.service import Service
-                from webdriver_manager.chrome import ChromeDriverManager
-                service = Service(ChromeDriverManager().install())
-                self.driver = webdriver.Chrome(service=service, options=chrome_options)
-            except ImportError:
-                # webdriver-manager가 없으면 일반 방식
-                self.driver = webdriver.Chrome(options=chrome_options)
+            # webdriver-manager 사용 시도 (재시도 로직 포함)
+            max_retries = 3
+            driver_initialized = False
+            
+            for attempt in range(max_retries):
+                try:
+                    from selenium.webdriver.chrome.service import Service
+                    from webdriver_manager.chrome import ChromeDriverManager
+                    import os
+                    import shutil
+                    
+                    # webdriver_manager 캐시 경로
+                    cache_path = os.path.join(os.path.expanduser('~'), '.wdm', 'drivers', 'chromedriver')
+                    
+                    # 이전 시도에서 실패한 경우 잠긴 파일 정리 시도
+                    if attempt > 0:
+                        logger.info(f"ChromeDriver 초기화 재시도 중... ({attempt + 1}/{max_retries})")
+                        time.sleep(2)  # 잠시 대기
+                        
+                        # 잠긴 chromedriver.exe 파일이 있는지 확인하고 정리 시도
+                        try:
+                            for root, dirs, files in os.walk(cache_path):
+                                for file in files:
+                                    if file == 'chromedriver.exe':
+                                        file_path = os.path.join(root, file)
+                                        try:
+                                            # 파일이 잠겨있는지 확인 (읽기 모드로 열기 시도)
+                                            with open(file_path, 'rb'):
+                                                pass
+                                        except (PermissionError, IOError):
+                                            # 파일이 잠겨있으면 삭제 시도
+                                            try:
+                                                os.chmod(file_path, 0o777)  # 권한 변경
+                                                os.remove(file_path)
+                                                logger.info(f"잠긴 chromedriver 파일 삭제: {file_path}")
+                                            except Exception as cleanup_error:
+                                                logger.warning(f"chromedriver 파일 정리 실패: {cleanup_error}")
+                        except Exception as cleanup_error:
+                            logger.debug(f"캐시 정리 중 오류 (무시): {cleanup_error}")
+                    
+                    # ChromeDriverManager 설치 시도
+                    try:
+                        driver_path = ChromeDriverManager().install()
+                        service = Service(driver_path)
+                        self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                        driver_initialized = True
+                        logger.info("ChromeDriver 초기화 성공 (webdriver-manager 사용)")
+                        break
+                    except (PermissionError, OSError) as perm_error:
+                        error_msg = str(perm_error)
+                        if 'WinError 5' in error_msg or '액세스가 거부되었습니다' in error_msg:
+                            logger.warning(f"ChromeDriver 파일 액세스 거부 (시도 {attempt + 1}/{max_retries}): {error_msg}")
+                            if attempt < max_retries - 1:
+                                # 다음 시도를 위해 잠시 대기
+                                time.sleep(3)
+                                continue
+                            else:
+                                # 마지막 시도 실패 시 일반 방식으로 폴백
+                                logger.warning("webdriver-manager 사용 실패, 일반 방식으로 시도합니다...")
+                                break
+                        else:
+                            raise
+                    except Exception as wdm_error:
+                        logger.warning(f"webdriver-manager 오류 (시도 {attempt + 1}/{max_retries}): {wdm_error}")
+                        if attempt < max_retries - 1:
+                            time.sleep(2)
+                            continue
+                        else:
+                            logger.warning("webdriver-manager 사용 실패, 일반 방식으로 시도합니다...")
+                            break
+                            
+                except ImportError:
+                    # webdriver-manager가 없으면 일반 방식
+                    logger.info("webdriver-manager를 사용할 수 없어 일반 방식으로 시도합니다...")
+                    break
+                except Exception as e:
+                    logger.warning(f"ChromeDriver 초기화 오류 (시도 {attempt + 1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                        continue
+                    else:
+                        break
+            
+            # webdriver-manager로 초기화 실패한 경우 일반 방식 시도
+            if not driver_initialized:
+                try:
+                    self.driver = webdriver.Chrome(options=chrome_options)
+                    logger.info("ChromeDriver 초기화 성공 (일반 방식)")
+                except Exception as fallback_error:
+                    logger.error(f"Chrome 드라이버 초기화 실패 (모든 방법 시도): {fallback_error}")
+                    logger.error("Chrome 브라우저와 ChromeDriver가 설치되어 있는지 확인하세요.")
+                    logger.error("또는 'py -m pip install webdriver-manager' 실행")
+                    raise
             
             self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         except Exception as e:
-            logger.error(f"Chrome 드라이버 초기화 오류: {e}")
+            logger.error(f"Chrome 드라이버 초기화 최종 오류: {e}")
             logger.error("Chrome 브라우저와 ChromeDriver가 설치되어 있는지 확인하세요.")
             logger.error("또는 'py -m pip install webdriver-manager' 실행")
             raise

@@ -9,14 +9,17 @@ import shutil
 
 def build_exe():
     """exe 파일 빌드"""
-    print("exe 파일 빌드를 시작합니다...")
+    print("=" * 60)
+    print("온카판 자동 댓글 매크로 빌드 시작")
+    print("=" * 60)
+    print()
     
     # .spec 파일이 있으면 사용, 없으면 옵션으로 빌드
     spec_file = '온카판_자동댓글_매크로.spec'
     
     if os.path.exists(spec_file):
-        print(f"{spec_file} 파일을 사용하여 빌드합니다...")
-        options = [spec_file, '--clean']  # --clean으로 이전 빌드 정리
+        print(f"[1/2] {spec_file} 파일을 사용하여 빌드합니다...")
+        options = [spec_file, '--clean', '--noconfirm']  # --clean으로 이전 빌드 정리
     else:
         print("spec 파일이 없어 옵션으로 빌드합니다...")
         # PyInstaller 옵션
@@ -45,13 +48,33 @@ def build_exe():
         options = [opt for opt in options if opt]
     
     try:
+        print("[2/2] PyInstaller 실행 중...")
+        print()
         PyInstaller.__main__.run(options)
-        print("\n빌드 완료!")
-        print("dist 폴더에 exe 파일이 생성되었습니다.")
+        print()
+        print("=" * 60)
+        print("빌드 완료!")
+        print("=" * 60)
+        print()
+        exe_path = os.path.join('dist', '온카판_자동댓글_매크로_v4.exe')
+        if os.path.exists(exe_path):
+            file_size = os.path.getsize(exe_path) / (1024 * 1024)  # MB
+            print(f"실행 파일: {exe_path}")
+            print(f"파일 크기: {file_size:.2f} MB")
+        else:
+            print("경고: 실행 파일을 찾을 수 없습니다.")
+        print()
     except Exception as e:
-        print(f"빌드 오류: {e}")
+        print()
+        print("=" * 60)
+        print("빌드 오류 발생!")
+        print("=" * 60)
+        print(f"오류 내용: {e}")
         import traceback
         traceback.print_exc()
+        return False
+    
+    return True
 
 if __name__ == "__main__":
     build_exe()

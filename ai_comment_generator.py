@@ -1,770 +1,1228 @@
 """
 AI 댓글 생성 모듈
-- OpenAI GPT를 이용한 자연스러운 댓글 생성
-- 실제 댓글 모방에 집중
+- OpenAI API를 사용하여 자연스러운 댓글 생성
+- 프롬프트 기반 생성 + 댓글 풀 fallback
+- 품질 검증 및 반복 방지
+- 통계 파일 저장 및 실패 원인 추적
 """
 
-from openai import OpenAI
+import os
+import sys
+import json
+import time
+import random
 import logging
-from typing import Optional, List, Dict
-import datetime
 import re
-from collections import Counter
+from enum import Enum
+from typing import List, Optional, Dict, Tuple
+from datetime import datetime, date
+from openai import OpenAI
+from openai import APIError, APIConnectionError, RateLimitError
+
+# 파일 락 지원
+try:
+    if os.name == 'nt':  # Windows
+        import msvcrt
+    else:  # Unix/Linux
+        import fcntl
+except ImportError:
+    pass
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# httpx 로그 비활성화
-logging.getLogger("httpx").setLevel(logging.WARNING)
+
+class ValidationFailureReason(Enum):
+    """검증 실패 원인"""
+    TOO_SHORT = "too_short"
+    TOO_LONG = "too_long"
+    BANNED_WORD = "banned_word"
+    DUPLICATE_RECENT = "duplicate_recent"
+    DUPLICATE_POST = "duplicate_post"
+    MULTILINE = "multiline"
+    SPECIAL_CHAR_SPAM = "special_char_spam"
+    BLACKLISTED = "blacklisted"
+    EMPTY = "empty"
 
 
 class AICommentGenerator:
-    def __init__(self, api_key: str, learning_analyzer=None):
-        self.client = OpenAI(api_key=api_key)
-        self.model = "gpt-4o-mini"  # 최신 미니 모델로 업그레이드 (짧은 댓글 모방 품질 향상)
-        self.learning_analyzer = learning_analyzer  # 학습 분석기 (선택적)
+    """AI 댓글 생성기"""
     
-    def generate_comment(self, post_content: str, post_title: str = "", actual_comments: List[str] = None) -> Optional[str]:
+    # 금지 표현 목록
+    FORBIDDEN_PHRASES = [
+        '힘내세요', '화이팅', '잘 될 거예요', '괜찮아질 거예요', 
+        '긍정적으로', '응원합니다', '이해합니다', '공감합니다',
+        '당신의', '분명히', '결국', '이 또한 지나갈',
+        '힘내', '화이팅입니다', '건승', '건승입니다',
+        '할 수 있어', '잘 될 거야', '괜찮아질 거야',
+        # 설명적/감탄적 표현
+        '진짜', '너무', '참', '정말', '대단', '와', '아',
+        # 반말 패턴
+        '~야', '~지', '~네', '~어', '~아'
+    ]
+    
+    # API 제한 설정
+    DAILY_API_CALL_LIMIT = 500  # 일일 API 호출 상한
+    DAILY_TOKEN_LIMIT = 200000  # 일일 토큰 상한 (200k tokens)
+    
+    # 통계 저장 간격 (초)
+    STATS_SAVE_INTERVAL = 60  # 1분마다 저장
+    
+    def __init__(self, api_key: str, learning_analyzer=None, 
+                 prompt_version: str = "v2", 
+                 max_history: int = 50):
         """
-        게시글 내용을 바탕으로 자연스러운 댓글 생성
-        - post_title: 게시글 제목
-        - post_content: 게시글 본문
-        - actual_comments: 이 게시글에 실제로 달린 댓글 목록 (최우선!)
-        
-        주의: 실제 댓글이 없으면 None을 반환하여 댓글 작성을 건너뜁니다.
+        Args:
+            api_key: OpenAI API 키
+            learning_analyzer: LearningAnalyzer 인스턴스 (선택)
+            prompt_version: 프롬프트 버전 (기본: v1)
+            max_history: 반복 방지를 위한 최근 댓글 히스토리 크기
         """
-        # 실제 댓글이 없으면 댓글 작성하지 않음
-        if not actual_comments or len(actual_comments) == 0:
-            logger.info("실제 댓글이 없는 게시글은 댓글 작성하지 않습니다.")
-            return None
+        self.client = OpenAI(api_key=api_key)
+        self.learning_analyzer = learning_analyzer
+        self.prompt_version = prompt_version
+        self.max_history = max_history
+        self.hot_reload_interval = 300
+        self.last_pool_reload = time.time()
         
-        # 본문 내용 저장 (후처리에서 사용)
-        self._current_post_content = post_content
-        self._current_post_title = post_title
+        # 파일 경로 설정
+        self._init_file_paths()
         
-        # 댓글이 적을 때(3개 이하) 본문 분석 강화 플래그
-        has_few_comments = len(actual_comments) <= 3
+        # 반복 방지를 위한 댓글 히스토리 (전역)
+        self.comment_history: List[str] = []
         
-        max_retries = 3
+        # 게시글별 댓글 히스토리 (같은 게시글에 같은 댓글 방지)
+        self.post_comment_map: Dict[str, str] = {}  # post_id -> comment
         
-        # 키워드 미리 추출 (검증용)
-        keywords = self._extract_keywords(actual_comments) if actual_comments else []
+        # 댓글 풀 및 블랙리스트 로드
+        self.comment_pool: Dict[str, List[str]] = {}
+        self.blacklist: set = set()
+        self._load_comment_pool()
+        
+        # 프롬프트 로드
+        self.system_prompt = self._load_prompt(prompt_version)
+        
+        # 통계 로드 (재시작 후에도 누적)
+        self.stats = self._load_stats()
+        
+        # API 사용량 추적 (일일 리셋)
+        self.api_usage = self._load_api_usage()
+        self._check_daily_reset()
+        
+        # 실패 원인 카운터
+        self.failure_reasons: Dict[str, int] = {
+            reason.value: 0 for reason in ValidationFailureReason
+        }
+        
+        # 풀 모드 강제 여부 (API 제한 도달 시)
+        self.force_pool_mode = False
+        
+        # 통계 저장 관련
+        self.last_stats_save = time.time()
+        self.stats_dirty = False  # 통계 변경 여부
+        
+        logger.info(f"AICommentGenerator 초기화 완료 (프롬프트: {prompt_version}, 풀: {len(self.comment_pool)}개)")
+    
+    def _init_file_paths(self):
+        """파일 경로 초기화"""
+        if getattr(sys, 'frozen', False):
+            base_path = os.path.dirname(sys.executable)
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        
+        self.stats_file = os.path.join(base_path, "stats.json")
+        self.comment_pool_file = os.path.join(base_path, "comment_pool.json")
+        self.prompts_dir = os.path.join(base_path, "prompts")
+    
+    def _load_comment_pool(self):
+        """댓글 풀 파일 로드 (파일 락 사용)"""
+        try:
+            if os.path.exists(self.comment_pool_file):
+                with open(self.comment_pool_file, 'r', encoding='utf-8') as f:
+                    # 파일 락
+                    try:
+                        if os.name == 'nt':
+                            try:
+                                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                            except NameError:
+                                pass
+                        else:
+                            try:
+                                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                            except NameError:
+                                pass
+                    except:
+                        pass
+                    
+                    data = json.load(f)
+                    
+                    # 락 해제
+                    try:
+                        if os.name == 'nt':
+                            try:
+                                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                            except NameError:
+                                pass
+                        else:
+                            try:
+                                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                            except NameError:
+                                pass
+                    except:
+                        pass
+                    
+                    # 기존 형식 호환성 유지
+                    old_comments = data.get('comments', [])
+                    if old_comments and isinstance(old_comments, list):
+                        # 기존 형식: 단일 리스트 -> 일반 카테고리로 변환
+                        self.comment_pool = {
+                            '일반': old_comments,
+                            **self._get_default_pool()
+                        }
+                        # 일반 카테고리에서 중복 제거
+                        for key in self.comment_pool:
+                            if key != '일반':
+                                self.comment_pool[key] = [c for c in self.comment_pool[key] if c not in old_comments]
+                    else:
+                        # 새 형식: 유형별 딕셔너리
+                        self.comment_pool = data.get('comment_pools', self._get_default_pool())
+                        if not isinstance(self.comment_pool, dict):
+                            self.comment_pool = self._get_default_pool()
+                    
+                    self.blacklist = set(data.get('blacklist', []))
+                    total_comments = sum(len(pool) for pool in self.comment_pool.values())
+                    logger.info(f"댓글 풀 로드 완료: {total_comments}개 댓글 ({len(self.comment_pool)}개 유형), {len(self.blacklist)}개 블랙리스트")
+            else:
+                # 기본 댓글 풀 사용
+                self.comment_pool = self._get_default_pool()
+                self._save_comment_pool()
+                total_comments = sum(len(pool) for pool in self.comment_pool.values())
+                logger.info(f"기본 댓글 풀 생성 완료: {total_comments}개 댓글 ({len(self.comment_pool)}개 유형)")
+        except Exception as e:
+            logger.error(f"댓글 풀 로드 오류: {e}")
+            self.comment_pool = self._get_default_pool()
+            self.blacklist = set()
+    
+    def _get_default_pool(self) -> Dict[str, List[str]]:
+        """게시글 유형별 기본 댓글 풀"""
+        return {
+            '거래': [
+                '쿨거하세여', '쿨거하세요', '쿨거하세영', '쿨거여', '쿨거여 ㅎ',
+                '존거래하세영', '좋은거래하세요', '거래 잘 하세용', '쿨거래 하세요',
+                '쿨거 하시길', '쿨거 고고', '무사거래요', '깔끔거래요',
+                '쿨거하셔요', '쿨거하세용', '쿨거하시길', '쿨거하세여 ㅎ',
+                '존거래요', '좋은거래요', '거래 잘 하세요', '쿨거래요'
+            ],
+            '돌발': [
+                '무사귀환합시당', '무사귀환띠', '무사귀환가여', '건승해요',
+                '무사귀환 하자구여', '돌발 무귀입니다', '무출기원합니다',
+                '무사히 귀환해요', '무사귀환 합시당~', '무사귀환요',
+                '위즈 무사귀환요', '위즈 무귀 가여', '위즈 무사귀환합시다',
+                '돌발 무출 기원', '돌발 무사귀환요', '돌발 무귀 가즈아',
+                '무귀 기원합니당', '위즈 돌발이네영', '돌발 무사귀환 가여',
+                '무출 기원합니다', '무사귀환 가요', '무귀 기원합니당'
+            ],
+            '후기': [
+                '좋은 후기네요', '후기 감사해요', '도움됐어요', '참고하겠습니다',
+                '좋은 정보네요', '유용하네요', '감사합니다', '도움됐습니다',
+                '좋네요', '괜찮네요', '괜찮아요', '좋아요', '좋습니다'
+            ],
+            '멘탈': [
+                '그러게요', '쉽지 않네요', '복잡하네요', '무난하네요',
+                '그렇네요', '맞네요', '그런가요', '그렇군요', '그렇죠',
+                '맞아요', '그래요', '그렇습니다', '맞습니다'
+            ],
+            '일반': [
+                '그러게요', '애매하네요', '쉽지 않네요', '복잡하네요', '무난하네요',
+                '비슷합니다', '그럴듯하네요', '축하합니다', '그렇네요', '맞네요',
+                '그런가요', '그렇군요', '그렇죠', '맞아요', '그래요',
+                '그렇습니다', '맞습니다', '그렇네', '맞네', '그래'
+            ],
+            '건승': [
+                '건승하세요', '건승입니다', '건승합시다', '건승이요', '건승해요',
+                '건승하시길', '건승하세영', '건승하세여', '건승이네요', '건승이에영',
+                '건승에에영', '건승이연', '건승하시길요', '건승하세용', '건승하셔요',
+                '건승이요~', '건승합니당', '건승하자구여', '건승이네영', '건승해요~'
+            ]
+        }
+    
+    def _save_comment_pool(self):
+        """댓글 풀 파일 저장 (파일 락 사용)"""
+        try:
+            data = {
+                'comment_pools': self.comment_pool,  # 유형별 풀
+                'blacklist': list(self.blacklist),
+                'meta': {
+                    'version': '2.0',  # 버전 업데이트
+                    'last_updated': datetime.now().isoformat()
+                }
+            }
+            temp_file = self.comment_pool_file + '.tmp'
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                # 파일 락
+                try:
+                    if os.name == 'nt':
+                        try:
+                            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                        except NameError:
+                            pass
+                    else:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                        except NameError:
+                            pass
+                except:
+                    pass
+                
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+                
+                # 락 해제
+                try:
+                    if os.name == 'nt':
+                        try:
+                            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                        except NameError:
+                            pass
+                    else:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        except NameError:
+                            pass
+                except:
+                    pass
+            
+            # 원자적 이동
+            if os.path.exists(self.comment_pool_file):
+                os.replace(temp_file, self.comment_pool_file)
+            else:
+                os.rename(temp_file, self.comment_pool_file)
+            
+            logger.debug("댓글 풀 저장 완료")
+        except Exception as e:
+            logger.error(f"댓글 풀 저장 오류: {e}")
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except:
+                pass
+    
+    def reload_comment_pool(self):
+        """댓글 풀 핫리로드 (실행 중 파일 변경 반영)"""
+        self._load_comment_pool()
+        logger.info("댓글 풀 핫리로드 완료")
+    
+    def _load_stats(self) -> Dict:
+        """통계 파일 로드 (재시작 후에도 누적, 파일 락 사용)"""
+        try:
+            if os.path.exists(self.stats_file):
+                with open(self.stats_file, 'r', encoding='utf-8') as f:
+                    # 파일 락
+                    try:
+                        if os.name == 'nt':
+                            try:
+                                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                            except NameError:
+                                pass
+                        else:
+                            try:
+                                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                            except NameError:
+                                pass
+                    except:
+                        pass
+                    
+                    stats = json.load(f)
+                    
+                    # 락 해제
+                    try:
+                        if os.name == 'nt':
+                            try:
+                                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                            except NameError:
+                                pass
+                        else:
+                            try:
+                                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                            except NameError:
+                                pass
+                    except:
+                        pass
+                    
+                    # 누적 통계 유지
+                    return {
+                        'generated_total': stats.get('generated_total', 0),
+                        'gpt_used': stats.get('gpt_used', 0),  # 하위 호환성
+                        'classification_used': stats.get('classification_used', 0),  # 게시글 분류 사용 횟수
+                        'pool_used': stats.get('pool_used', 0),
+                        'skipped': stats.get('skipped', 0),
+                        'validation_fail_total': stats.get('validation_fail_total', 0),
+                        'regen_count': stats.get('regen_count', 0),
+                        'api_errors': stats.get('api_errors', 0),
+                        'last_updated': stats.get('last_updated', datetime.now().isoformat()),
+                        'failure_reasons': stats.get('failure_reasons', {})
+                    }
+            else:
+                return self._init_stats()
+        except Exception as e:
+            logger.error(f"통계 로드 오류: {e}")
+            return self._init_stats()
+    
+    def _init_stats(self) -> Dict:
+        """초기 통계 구조"""
+        return {
+            'generated_total': 0,
+            'gpt_used': 0,  # 하위 호환성
+            'classification_used': 0,  # 게시글 분류 사용 횟수
+            'pool_used': 0,
+            'skipped': 0,
+            'validation_fail_total': 0,
+            'regen_count': 0,
+            'api_errors': 0,
+            'last_updated': datetime.now().isoformat(),
+            'failure_reasons': {}
+        }
+    
+    def _save_stats(self, force: bool = False):
+        """통계 파일 저장 (배치 저장, 파일 락 사용)"""
+        current_time = time.time()
+        
+        # 강제 저장이 아니고, 간격이 안 지났고, 변경사항이 없으면 스킵
+        if not force and (current_time - self.last_stats_save < self.STATS_SAVE_INTERVAL) and not self.stats_dirty:
+            return
+        
+        try:
+            self.stats['last_updated'] = datetime.now().isoformat()
+            self.stats['failure_reasons'] = self.failure_reasons.copy()
+            self.stats['api_usage'] = self.api_usage.copy()
+            
+            temp_file = self.stats_file + '.tmp'
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                # 파일 락
+                try:
+                    if os.name == 'nt':
+                        try:
+                            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                        except NameError:
+                            pass
+                    else:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                        except NameError:
+                            pass
+                except:
+                    pass
+                
+                json.dump(self.stats, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+                
+                # 락 해제
+                try:
+                    if os.name == 'nt':
+                        try:
+                            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                        except NameError:
+                            pass
+                    else:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        except NameError:
+                            pass
+                except:
+                    pass
+            
+            # 원자적 이동
+            if os.path.exists(self.stats_file):
+                os.replace(temp_file, self.stats_file)
+            else:
+                os.rename(temp_file, self.stats_file)
+            
+            self.last_stats_save = current_time
+            self.stats_dirty = False
+        except Exception as e:
+            logger.error(f"통계 저장 오류: {e}")
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except:
+                pass
+    
+    def _load_api_usage(self) -> Dict:
+        """API 사용량 로드"""
+        try:
+            if os.path.exists(self.stats_file):
+                with open(self.stats_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    usage = data.get('api_usage', {})
+                    return {
+                        'calls_today': usage.get('calls_today', 0),
+                        'tokens_today': usage.get('tokens_today', 0),
+                        'last_reset_date': usage.get('last_reset_date', date.today().isoformat())
+                    }
+            return {
+                'calls_today': 0,
+                'tokens_today': 0,
+                'last_reset_date': date.today().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"API 사용량 로드 오류: {e}")
+            return {
+                'calls_today': 0,
+                'tokens_today': 0,
+                'last_reset_date': date.today().isoformat()
+            }
+    
+    def _check_daily_reset(self):
+        """일일 리셋 확인"""
+        today = date.today().isoformat()
+        if self.api_usage['last_reset_date'] != today:
+            self.api_usage['calls_today'] = 0
+            self.api_usage['tokens_today'] = 0
+            self.api_usage['last_reset_date'] = today
+            self.force_pool_mode = False
+            logger.info("일일 API 사용량 리셋")
+    
+    def _check_api_limits(self) -> bool:
+        """API 제한 확인 (True: 제한 도달, False: 사용 가능)"""
+        self._check_daily_reset()
+        
+        if (self.api_usage['calls_today'] >= self.DAILY_API_CALL_LIMIT or
+            self.api_usage['tokens_today'] >= self.DAILY_TOKEN_LIMIT):
+            if not self.force_pool_mode:
+                logger.warning(f"API 제한 도달: 호출 {self.api_usage['calls_today']}/{self.DAILY_API_CALL_LIMIT}, "
+                             f"토큰 {self.api_usage['tokens_today']}/{self.DAILY_TOKEN_LIMIT}")
+                self.force_pool_mode = True
+            return True
+        return False
+    
+    def _load_prompt(self, version: str) -> str:
+        """프롬프트 파일 로드"""
+        try:
+            prompt_file = os.path.join(self.prompts_dir, f"comment_style_{version}.txt")
+            
+            if os.path.exists(prompt_file):
+                with open(prompt_file, 'r', encoding='utf-8') as f:
+                    prompt = f.read().strip()
+                logger.info(f"프롬프트 로드 성공: {prompt_file}")
+                return prompt
+            else:
+                logger.warning(f"프롬프트 파일을 찾을 수 없습니다: {prompt_file}")
+                return self._get_default_prompt()
+        except Exception as e:
+            logger.error(f"프롬프트 로드 오류: {e}")
+            return self._get_default_prompt()
+    
+    def _get_default_prompt(self) -> str:
+        """기본 프롬프트 (댓글 후보 생성용)"""
+        return """역할
+너는 온라인 커뮤니티에서 흔히 보이는 짧고 무난한 반응 댓글 초안 생성기다.
+토론·조언·분석을 하지 않는다.
+
+입력
+
+게시글 제목
+
+게시글 본문
+
+이미 달린 댓글 몇 개
+
+출력 목표
+커뮤니티 분위기에 묻히는 짧은 반응형 댓글 후보를 만든다.
+
+규칙
+
+댓글은 한 줄, 6~14자 위주로 작성
+
+문장 완성도를 일부러 낮춰라 (구어체, 축약 허용)
+
+조언, 판단, 해결책, 설명 금지
+
+감탄·동조·공감 중 하나만 담아라
+
+이모지 금지, 느낌표는 최대 1개
+
+이미 달린 댓글과 의미·어조가 겹쳐도 되지만 문장은 달라야 한다
+
+"깔끔함/정중함/정보성"이 느껴지면 탈락이다
+
+작업 절차
+
+(1) 이 게시글을 아래 유형 중 하나로만 분류한다
+일상/수다 · 감정토로 · 거래 · 돌발/대기 · 결과후기 · 감탄/자랑
+
+(2) 해당 유형에서 사람들이 흔히 쓰는 반응 패턴을 떠올린다
+
+(3) 그 패턴 안에서 튀지 않는 댓글 후보 8개를 만든다
+
+출력 형식
+
+후보 댓글만 줄바꿈으로 출력
+
+설명, 분류 결과, 코멘트 절대 출력하지 말 것"""
+    
+    def can_generate_comment(self, post_content: str) -> bool:
+        """댓글 생성 가능 여부 확인"""
+        if not post_content or len(post_content.strip()) < 3:
+            return False
+        return True
+    
+    def _extract_keywords(self, comments: List[str] = None, post_title: str = "", post_content: str = "") -> List[str]:
+        """댓글, 제목, 본문에서 의미 있는 키워드 추출"""
+        keywords = []
+        
+        # 중요 키워드 우선 검색 (게시글 제목/본문에서)
+        important_keywords = [
+            '건승', '쿨거', '무사귀환', '무귀', '무출', '존거래', '돌발', '위즈', 
+            '뱅', '장줄', '포인트', '콩', '삽니다', '팝니다', '거래', '구매', '판매',
+            '후기', '신겜', '해봄', '결과', '배송', '완료', '도착',
+            '멘탈', '하아', '마렵', '힘드', '어렵', '스트레스', '고민', '힘들'
+        ]
+        
+        combined_text = (post_title + " " + post_content).lower()
+        for keyword in important_keywords:
+            if keyword in combined_text:
+                keywords.append(keyword)
+        
+        # 댓글에서 키워드 추출
+        if comments:
+            # 조사 목록 (제외할 단어들)
+            particles = [
+                '이', '가', '을', '를', '에', '의', '와', '과', '도', '만', '조차', '까지',
+                '에서', '에게', '께서', '한테', '더러', '로', '으로', '처럼', '같이',
+                '만큼', '보다', '부터', '까지', '조차', '마저', '은', '는', '도',
+                '라도', '이라도', '이나', '이나마', '든지', '든가', '든', '조차',
+                '요', '영', '여', '세영', '세요', '세요', '하세요', '하세영'
+            ]
+            
+            # 댓글에서 의미 있는 단어 추출
+            for comment in comments[:10]:
+                if not comment or len(comment.strip()) < 2:
+                    continue
+                
+                # 중요 키워드가 댓글에 있는지 확인
+                for keyword in important_keywords:
+                    if keyword in comment and keyword not in keywords:
+                        keywords.append(keyword)
+                
+                # 2-5자 한글 단어 추출 (조사 제외)
+                words = re.findall(r'[가-힣]{2,5}', comment)
+                for word in words:
+                    # 조사가 아니고, 중요 키워드가 아니며, 의미 있는 단어인 경우
+                    if (word not in particles and 
+                        word not in keywords and 
+                        len(word) >= 2 and
+                        word not in ['게시', '댓글', '작성', '조회', '추천', '비추', '목록', '이전', '다음']):
+                        keywords.append(word)
+        
+        # 중복 제거 및 최대 10개 반환
+        unique_keywords = []
+        seen = set()
+        for kw in keywords:
+            if kw not in seen:
+                unique_keywords.append(kw)
+                seen.add(kw)
+                if len(unique_keywords) >= 10:
+                    break
+        
+        return unique_keywords
+    
+    def _detect_post_type_heuristic(self, post_content: str, post_title: str = "") -> str:
+        """휴리스틱으로 게시글 유형 판단 (fallback용)"""
+        combined_text = (post_title + " " + post_content).lower()
+        
+        # 거래 관련 키워드
+        trade_keywords = ['삽니다', '팝니다', '쿨거', '포인트', '콩', '거래', '구매', '판매', '존거래']
+        if any(keyword in combined_text for keyword in trade_keywords):
+            return '거래'
+        
+        # 돌발/대기 관련 키워드
+        event_keywords = ['돌발', '대기', '무사귀환', '무출', '위즈', '뱅', '장줄']
+        if any(keyword in combined_text for keyword in event_keywords):
+            return '돌발'
+        
+        # 후기 관련 키워드
+        review_keywords = ['후기', '신겜', '해봄', '결과', '배송', '완료', '도착']
+        if any(keyword in combined_text for keyword in review_keywords):
+            return '후기'
+        
+        # 멘탈 관련 키워드
+        mental_keywords = ['하아', '마렵', '멘탈', '힘드', '어렵', '스트레스', '고민', '힘들']
+        if any(keyword in combined_text for keyword in mental_keywords):
+            return '멘탈'
+        
+        # 기본값
+        return '일반'
+    
+    def _validate_comment(self, comment: str, check_duplicate: bool = True, 
+                         post_id: Optional[str] = None) -> Tuple[bool, Optional[ValidationFailureReason]]:
+        """
+        댓글 품질 검증 (새로운 규칙 적용)
+        
+        Args:
+            comment: 검증할 댓글
+            check_duplicate: 중복 체크 여부
+            post_id: 게시글 ID (게시글별 중복 체크용)
+        
+        Returns:
+            (검증 통과 여부, 실패 원인)
+        """
+        if not comment:
+            return False, ValidationFailureReason.EMPTY
+        
+        cleaned = comment.strip()
+        char_count = len(cleaned.replace(' ', '').replace('\n', ''))
+        
+        # 커뮤니티 토큰 체크 (ㅋㅋ, ㅠㅠ, ㄷㄷ, ㅎㅎ, ㅜㅜ 등)
+        community_tokens = ['ㅋ', 'ㅠ', 'ㄷ', 'ㅎ', 'ㅜ', 'ㅅ', 'ㅇ']
+        has_community_token = any(token in cleaned for token in community_tokens)
+        
+        # 1. 길이 검증 (2~20자로 완화)
+        # 매우 짧은 반응도 허용, 최대 길이도 완화
+        if char_count < 2:
+            return False, ValidationFailureReason.TOO_SHORT
+        if char_count > 20:  # 14자에서 20자로 완화
+            return False, ValidationFailureReason.TOO_LONG
+        
+        # 2. 줄 수 검증
+        if '\n' in cleaned:
+            return False, ValidationFailureReason.MULTILINE
+        
+        # 3. 금지 표현 검증
+        cleaned_lower = cleaned.lower()
+        for phrase in self.FORBIDDEN_PHRASES:
+            if phrase in cleaned_lower:
+                return False, ValidationFailureReason.BANNED_WORD
+        
+        # 4. 블랙리스트 검증
+        if cleaned in self.blacklist:
+            return False, ValidationFailureReason.BLACKLISTED
+        
+        # 5. 이모지 검증 (완화 - 실제 이모지만 체크)
+        # 특수문자는 커뮤니티 댓글의 자연스러운 표현이므로 검증하지 않음
+        # 이모지 패턴을 더 엄격하게 (실제 이모지만)
+        emoji_pattern = re.compile(
+            "["
+            "\U0001F600-\U0001F64F"  # emoticons
+            "\U0001F300-\U0001F5FF"  # symbols & pictographs
+            "\U0001F680-\U0001F6FF"  # transport & map symbols
+            "\U0001F1E0-\U0001F1FF"  # flags
+            "]+", flags=re.UNICODE)
+        # 이모지가 명확하게 포함된 경우만 실패 (한 글자 이상)
+        if emoji_pattern.search(cleaned) and len(emoji_pattern.findall(cleaned)) > 0:
+            # 이모지가 전체 댓글의 대부분을 차지하는 경우만 실패
+            emoji_chars = emoji_pattern.findall(cleaned)
+            total_emoji_length = sum(len(e) for e in emoji_chars)
+            if total_emoji_length > len(cleaned) * 0.5:  # 이모지가 50% 이상
+                return False, ValidationFailureReason.SPECIAL_CHAR_SPAM
+        
+        # 7. "깔끔함/정중함/정보성" 감지 (간단한 휴리스틱)
+        formal_words = ['감사합니다', '감사드립니다', '부탁드립니다', '도와주세요', 
+                       '알겠습니다', '이해했습니다', '확인했습니다', '참고하겠습니다']
+        if any(word in cleaned for word in formal_words):
+            return False, ValidationFailureReason.BANNED_WORD
+        
+        # 8. 반말 감지 (존댓말만 허용)
+        # 반말 패턴: ~야, ~지, ~네(반말), ~어, ~아 (문장 끝)
+        # 단, "~네요", "~네영" 같은 존댓말은 허용
+        if not any(word in cleaned for word in ['네요', '네영', '네여', '세요', '세영', '세여', '요', '영', '여', '합니', '드립니']):
+            banmal_patterns = [
+                r'[가-힣]+야$',  # "나도 곧 퇴근이야"
+                r'[가-힣]+지$',  # "그렇지"
+                r'[가-힣]+네$',  # "그렇네" (반말)
+                r'[가-힣]+어$',  # "가봐"
+                r'[가-힣]+아$',  # "가봐"
+            ]
+            for pattern in banmal_patterns:
+                if re.search(pattern, cleaned):
+                    return False, ValidationFailureReason.BANNED_WORD
+        
+        # 9. 설명적/감탄적 표현 감지 (완화)
+        explanatory_words = ['진짜', '너무', '참', '정말', '대단', '와!', '아!']
+        explanatory_count = sum(1 for word in explanatory_words if word in cleaned)
+        # 2개 이상이면 실패 (너무 설명적)
+        if explanatory_count >= 2:
+            return False, ValidationFailureReason.BANNED_WORD
+        
+        # 10. 중복 확인 (옵션)
+        if check_duplicate:
+            # 전역 히스토리 중복 체크
+            if self._is_duplicate(cleaned):
+                return False, ValidationFailureReason.DUPLICATE_RECENT
+            
+            # 게시글별 중복 체크
+            if post_id and post_id in self.post_comment_map:
+                if self.post_comment_map[post_id] == cleaned:
+                    return False, ValidationFailureReason.DUPLICATE_POST
+        
+        return True, None
+    
+    def _is_duplicate(self, comment: str) -> bool:
+        """최근 히스토리와 중복 확인 (유사 문장도 감지)"""
+        cleaned = comment.strip()
+        
+        # 완전 동일 체크
+        if cleaned in self.comment_history:
+            return True
+        
+        # 유사 문장 체크 (공백 제거 + 접미사 정규화)
+        cleaned_normalized = re.sub(r'[요여영당]', '요', cleaned.replace(' ', ''))
+        for hist_comment in self.comment_history[-20:]:  # 최근 20개만 체크
+            hist_normalized = re.sub(r'[요여영당]', '요', hist_comment.replace(' ', ''))
+            # 핵심 키워드가 같고 길이가 비슷하면 유사로 판단
+            if cleaned_normalized == hist_normalized:
+                return True
+            # 핵심 토큰 비교 (쿨거, 존거래, 무사귀환 등)
+            key_tokens_comment = set(re.findall(r'쿨거|존거래|무사귀환|무귀|무출|돌발|위즈', cleaned))
+            key_tokens_hist = set(re.findall(r'쿨거|존거래|무사귀환|무귀|무출|돌발|위즈', hist_comment))
+            if key_tokens_comment and key_tokens_comment == key_tokens_hist:
+                return True
+        
+        return False
+    
+    def _add_to_history(self, comment: str, post_id: Optional[str] = None):
+        """히스토리에 추가 (전역 + 게시글별)"""
+        cleaned = comment.strip()
+        if cleaned:
+            # 전역 히스토리
+            self.comment_history.append(cleaned)
+            if len(self.comment_history) > self.max_history:
+                self.comment_history.pop(0)
+            
+            # 게시글별 히스토리
+            if post_id:
+                self.post_comment_map[post_id] = cleaned
+                # 게시글별 맵 크기 제한 (메모리 관리)
+                if len(self.post_comment_map) > 1000:
+                    # 가장 오래된 항목 제거 (FIFO)
+                    oldest_key = next(iter(self.post_comment_map))
+                    del self.post_comment_map[oldest_key]
+    
+    def _record_failure(self, reason: ValidationFailureReason):
+        """실패 원인 기록"""
+        self.failure_reasons[reason.value] = self.failure_reasons.get(reason.value, 0) + 1
+        self.stats['validation_fail_total'] += 1
+        self.stats_dirty = True
+    
+    def _generate_comment_candidates(self, post_content: str, post_title: str = "", 
+                                    actual_comments: List[str] = None,
+                                    max_retries: int = 2) -> List[str]:
+        """OpenAI API로 댓글 후보 8개 생성 (재시도 포함)"""
+        # API 제한 확인
+        if self._check_api_limits():
+            logger.debug("API 제한 도달로 풀 모드 사용")
+            return []
+        
+        # 키워드 추출 (제목, 본문, 댓글에서)
+        extracted_keywords = self._extract_keywords(
+            comments=actual_comments,
+            post_title=post_title,
+            post_content=post_content
+        )
+        
+        # 건승 키워드 감지
+        combined_text = (post_title + " " + post_content).lower()
+        has_geungseung = "건승" in combined_text or "건승" in extracted_keywords
         
         for attempt in range(max_retries):
             try:
-                # 안전한 문자열 처리
-                safe_title = self._safe_string(post_title)
-                safe_content = self._safe_string(post_content[:500])  # 본문은 500자로 제한
+                # 유저 메시지 구성
+                user_message = f"게시글 제목: {post_title}\n게시글 본문: {post_content}"
                 
-                # 실제 댓글이 있으면 무조건 모방 모드
-                # 댓글이 적을 때는 본문 분석 강화
-                comment = self._generate_with_actual_comments(
-                    safe_title, safe_content, actual_comments, keywords, has_few_comments
+                # 추출된 키워드 추가
+                if extracted_keywords:
+                    user_message += f"\n\n🔑 【중요 키워드】\n"
+                    user_message += f"{', '.join(extracted_keywords[:8])}\n"
+                    user_message += "\n위 키워드들을 반드시 참고하여 댓글을 생성하세요.\n"
+                    user_message += "특히 '건승', '쿨거', '무사귀환', '존거래', '돌발', '위즈' 같은 키워드가 있으면 해당 키워드를 포함한 댓글을 우선 생성하세요."
+                
+                # 건승 키워드가 있으면 특별 지시 추가
+                if has_geungseung:
+                    user_message += "\n\n⚠️ 중요: 이 게시글에 '건승'이라는 키워드가 있습니다."
+                    user_message += "\n반드시 '건승하세요', '건승입니다', '건승합시다', '건승이요' 같은 건승 관련 댓글을 생성하세요."
+                    user_message += "\n건승 관련 표현을 포함한 댓글 후보를 우선적으로 만들어주세요."
+                
+                # 이미 달린 댓글 추가 (강화)
+                if actual_comments and len(actual_comments) > 0:
+                    filtered_comments = [
+                        c for c in actual_comments 
+                        if isinstance(c, str) and 2 <= len(c.strip()) <= 20
+                    ]
+                    if filtered_comments:
+                        user_message += f"\n\n【이미 달린 실제 댓글들 - 반드시 참고하세요】\n"
+                        user_message += "위 댓글들처럼 짧고 무난하게 반응만 하세요. 설명하지 마세요.\n"
+                        for i, comment in enumerate(filtered_comments[:8], 1):  # 최대 8개
+                            user_message += f"{i}. {comment}\n"
+                        user_message += "\n위 댓글들의 톤, 길이, 스타일을 정확히 따라하세요.\n"
+                        user_message += "- 반드시 존댓말 사용 (~요, ~영, ~여, ~세영 등)\n"
+                        user_message += "- 설명하지 말고 짧게 반응만 (~이영, ~바리영, ~하세용 같은 패턴)\n"
+                        user_message += "- '진짜', '너무', '참', '정말' 같은 설명적 표현 최소화\n"
+                
+                # API 호출
+                response = self.client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    temperature=0.8,  # 다양성을 위해 높은 temperature
+                    top_p=0.9,
+                    max_tokens=120,  # 후보 8개 (각 4~12자)
                 )
                 
-                if comment:
-                    # 로그 간소화: 생성된 댓글만 간단히 출력
-                    logger.debug(f"[시도 {attempt + 1}] 생성된 댓글: {comment}")
-                    
-                    # 키워드 포함 여부 확인 (댓글이 적을 때는 완화)
-                    if keywords and not has_few_comments:  # 댓글이 적을 때는 키워드 검증 완화
-                        if not self._validate_keywords_in_comment(comment, keywords):
-                            logger.warning(f"[시도 {attempt + 1}] 키워드 미포함으로 필터링. 원본: '{comment}', 키워드: {keywords}")
-                            if attempt < max_retries - 1:
-                                import time
-                                time.sleep(0.5)  # 재시도 대기 시간 줄임
-                                continue
-                            else:
-                                logger.error(f"[시도 {attempt + 1}] 키워드 포함 실패. 최대 재시도 횟수 도달.")
-                    
-                    # 후처리
-                    processed_comment = self._post_process(comment)
-                    
-                    # 후처리 후에도 유효한 댓글이면 반환
-                    if processed_comment:
-                        # 실제 댓글과의 유사도 검증 (단순 복사 방지)
-                        if not self._validate_not_duplicate(processed_comment, actual_comments):
-                            logger.warning(f"[시도 {attempt + 1}] 실제 댓글과 너무 유사하여 필터링. 생성: '{processed_comment}'")
-                            if attempt < max_retries - 1:
-                                import time
-                                time.sleep(0.5)  # 재시도 대기 시간 줄임
-                                continue
-                            else:
-                                logger.error(f"[시도 {attempt + 1}] 실제 댓글과 유사도 검증 실패. 최대 재시도 횟수 도달.")
-                        
-                        # 키워드 재확인은 제거 (원본에서 통과했으면 OK, 후처리로 잘려나갈 수 있으므로)
-                        # 후처리 후 키워드 검증은 불필요한 재시도를 유발할 수 있어 제거
-                        
-                        # 디버그 로그 기록
-                        self._log_generation(post_title, post_content, actual_comments, processed_comment)
-                        return processed_comment
-                    else:
-                        # 후처리에서 필터링된 경우 재시도
-                        logger.warning(f"[시도 {attempt + 1}] 후처리에서 필터링됨. 원본: '{comment}' -> None")
-                        if attempt < max_retries - 1:
-                            import time
-                            time.sleep(0.5)  # 재시도 대기 시간 줄임
-                            continue
-                        else:
-                            logger.error(f"[시도 {attempt + 1}] 최대 재시도 횟수 도달. 댓글 생성 실패.")
+                # 사용량 추적
+                self.api_usage['calls_today'] += 1
+                if hasattr(response, 'usage'):
+                    tokens = response.usage.total_tokens if response.usage else 0
+                    self.api_usage['tokens_today'] += tokens
+                
+                response_text = response.choices[0].message.content.strip()
+                
+                # 후보 댓글 파싱 (줄바꿈으로 구분)
+                candidates = []
+                for line in response_text.split('\n'):
+                    line = line.strip()
+                    # 번호나 불필요한 문자 제거
+                    line = re.sub(r'^\d+[\.\)]\s*', '', line)  # "1. " 또는 "1) " 제거
+                    line = line.strip('"\'')  # 따옴표 제거
+                    if line and len(line.replace(' ', '')) >= 2:  # 최소 길이 체크 (공백 제외, 2자 이상)
+                        candidates.append(line)
+                
+                # 생성된 후보 로깅 (디버깅용)
+                if candidates:
+                    logger.debug(f"생성된 후보 목록: {candidates}")
+                
+                if candidates:
+                    logger.debug(f"댓글 후보 생성 성공: {len(candidates)}개")
+                    self.stats['classification_used'] = self.stats.get('classification_used', 0) + 1
+                    self.stats_dirty = True
+                    return candidates[:8]  # 최대 8개만 반환
                 else:
-                    logger.warning(f"[시도 {attempt + 1}] _generate_with_actual_comments가 None을 반환했습니다.")
+                    logger.warning("생성된 후보가 없음")
                     if attempt < max_retries - 1:
-                        logger.info(f"[시도 {attempt + 1}] 재시도 대기 중...")
-                        import time
-                        time.sleep(0.5)  # 재시도 대기 시간 줄임
                         continue
                     else:
-                        logger.error(f"[시도 {attempt + 1}] 최대 재시도 횟수 도달. 댓글 생성 실패.")
+                        return []
                     
-            except Exception as e:
-                logger.error(f"댓글 생성 오류 (시도 {attempt + 1}/{max_retries}): {e}")
-                import traceback
-                logger.error(f"트레이스백: {traceback.format_exc()}")
+            except RateLimitError as e:
+                logger.warning(f"Rate limit 오류 (시도 {attempt + 1}/{max_retries}): {e}")
+                self.stats['api_errors'] += 1
+                self.stats_dirty = True
                 if attempt < max_retries - 1:
-                    import time
-                    time.sleep(0.5)  # 재시도 대기 시간 줄임
+                    wait_time = 5 * (2 ** attempt)
+                    time.sleep(wait_time)
                     continue
-                return None
+                else:
+                    return []
+            except APIConnectionError as e:
+                logger.warning(f"네트워크 오류 (시도 {attempt + 1}/{max_retries}): {e}")
+                self.stats['api_errors'] += 1
+                self.stats_dirty = True
+                if attempt < max_retries - 1:
+                    wait_time = 1 * (3 ** attempt)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return []
+            except APIError as e:
+                logger.error(f"API 오류 (시도 {attempt + 1}/{max_retries}): {e}")
+                self.stats['api_errors'] += 1
+                self.stats_dirty = True
+                if attempt < max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                else:
+                    return []
+            except Exception as e:
+                logger.error(f"예상치 못한 오류 (시도 {attempt + 1}/{max_retries}): {e}")
+                self.stats['api_errors'] += 1
+                self.stats_dirty = True
+                if attempt < max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                else:
+                    return []
         
-        logger.error("모든 재시도 실패. None 반환")
+        return []
+    
+    def _get_from_pool(self, post_type: str = '일반', 
+                      exclude_comments: List[str] = None, 
+                      post_id: Optional[str] = None) -> Optional[str]:
+        """댓글 풀에서 선택 (유형별, 중복 제외, 반복 방지 강화)"""
+        # 유형별 풀 선택
+        if post_type not in self.comment_pool:
+            post_type = '일반'
+        
+        type_pool = self.comment_pool.get(post_type, self.comment_pool.get('일반', []))
+        
+        if not type_pool:
+            # 해당 유형 풀이 비어있으면 일반 풀 사용
+            type_pool = self.comment_pool.get('일반', [])
+        
+        exclude_set = set(exclude_comments or [])
+        exclude_set.update(self.comment_history)
+        exclude_set.update(self.blacklist)
+        
+        # 게시글별 히스토리도 제외
+        if post_id and post_id in self.post_comment_map:
+            exclude_set.add(self.post_comment_map[post_id])
+        
+        # 중복 체크 (유사 문장 포함)
+        available = []
+        for c in type_pool:
+            if c not in exclude_set and not self._is_duplicate(c):
+                available.append(c)
+        
+        if available:
+            comment = random.choice(available)
+            self.stats['pool_used'] += 1
+            self.stats['generated_total'] += 1
+            self.stats_dirty = True
+            self._save_stats()
+            return comment
+        
+        # 풀에 사용 가능한 댓글이 없으면 히스토리 일부만 무시 (최근 10개만)
+        recent_history = self.comment_history[-10:] if len(self.comment_history) > 10 else []
+        exclude_set = set(exclude_comments or [])
+        exclude_set.update(recent_history)
+        exclude_set.update(self.blacklist)
+        
+        if post_id and post_id in self.post_comment_map:
+            exclude_set.add(self.post_comment_map[post_id])
+        
+        available = []
+        for c in type_pool:
+            if c not in exclude_set:
+                # 유사도 체크는 완화 (최근 히스토리만 체크)
+                is_dup = False
+                for hist in recent_history:
+                    if c == hist:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    available.append(c)
+        
+        if available:
+            comment = random.choice(available)
+            self.stats['pool_used'] += 1
+            self.stats['generated_total'] += 1
+            self.stats_dirty = True
+            self._save_stats()
+            logger.warning(f"댓글 풀 선택: 최근 히스토리 일부 무시 (사용 가능한 댓글 부족)")
+            return comment
+        
+        # 그래도 없으면 블랙리스트만 제외하고 선택 (최후의 수단)
+        available = [c for c in type_pool if c not in self.blacklist]
+        if available:
+            comment = random.choice(available)
+            self.stats['pool_used'] += 1
+            self.stats['generated_total'] += 1
+            self.stats_dirty = True
+            self._save_stats()
+            logger.warning(f"댓글 풀 선택: 히스토리 무시 (사용 가능한 댓글 부족)")
+            return comment
+        
         return None
     
-    def _extract_keywords(self, comments: List[str], max_length: int = 10) -> List[str]:
-        """댓글에서 가장 많이 나온 키워드 추출 (10자 이내 댓글만 분석)
+    def generate_comment_candidates_only(self, post_content: str, post_title: str = "", 
+                                         actual_comments: List[str] = None) -> List[str]:
+        """
+        댓글 후보만 생성 (GUI에서 선택용)
         
         Args:
-            comments: 댓글 목록 (문자열 또는 dict 형태 가능)
-            max_length: 분석할 댓글의 최대 길이 (기본값: 10자)
-        """
-        # 1) 먼저 전부 텍스트로 정리 (dict 형태도 처리)
-        comment_texts: List[str] = []
-        for c in comments:
-            if isinstance(c, str):
-                t = c
-            else:
-                # dict 형태일 경우 content 우선 사용
-                t = c.get('content', str(c)) if isinstance(c, dict) else str(c)
-            if t and len(t.strip()) > 0:
-                comment_texts.append(t.strip())
+            post_content: 게시글 본문
+            post_title: 게시글 제목
+            actual_comments: 실제 댓글 목록
         
-        if not comment_texts:
+        Returns:
+            댓글 후보 리스트 (최대 8개)
+        """
+        if not self.can_generate_comment(post_content):
             return []
         
-        # 2) 여기부터는 comment_texts 기준으로 사용
-        # 10자 이내 댓글만 필터링
-        short_comments = [c for c in comment_texts if len(c) <= max_length]
+        # AI로 댓글 후보 8개 생성
+        candidates = []
+        if not self.force_pool_mode:
+            candidates = self._generate_comment_candidates(
+                post_content, post_title, actual_comments
+            )
+            logger.debug(f"생성된 댓글 후보: {len(candidates)}개")
         
-        if not short_comments:
-            # 10자 이내 댓글이 없으면 전체 댓글 사용
-            short_comments = comment_texts
+        # 검증 통과한 후보만 반환
+        valid_candidates = []
+        for candidate in candidates:
+            is_valid, _ = self._validate_comment(candidate, check_duplicate=False)
+            if is_valid:
+                valid_candidates.append(candidate)
         
-        # 커뮤니티 특수 용어 사전 (우선 추출)
-        special_terms = [
-            '담타', '렉카', '포전', '포바', '단포바', '깊전', '댓노', '멘징',
-            '골스', '오클', '느바', '크보', '믈브', '해축', '새축', '일야',
-            '담배', '쌈배', '맛담', '맛점', '맛저', '맛아', '맛커', '맛런치',
-            '무브', '후땡', '고우', '꿀잼', '개꿀잼', '쫄깃', '연장', '페이백',
-            '추워', '춥', '감기', '한숨', '식곤증', '졸립', '런치', '점심',
-            '벳계', '벳컨', '쿨거', '입금', '지연', '조회수',
-            '핫식스', '원플원', '도핑', '돌발', '돌대기', '신라면', '코코아',
-            '플핸', '오바', '마핸', '석살', '석사', '독사', '훈카', '화력',
-            '햄부기', '야키토리', '무한도전', '런닝맨'
-        ]
-        
-        all_words = []
-        found_special_terms = []
-        
-        for comment in short_comments:
-            # 특수 용어 우선 검색
-            comment_lower = comment.lower()
-            for term in special_terms:
-                if term in comment_lower and term not in found_special_terms:
-                    found_special_terms.append(term)
-            
-            # 띄어쓰기 기준으로 단어 분리 (우선)
-            words_by_space = re.findall(r'[가-힣]+', comment)
-            for word in words_by_space:
-                if 2 <= len(word) <= 4:  # 2-4글자만
-                    all_words.append(word)
-            
-            # 띄어쓰기로 분리되지 않은 경우, 한글만 추출하여 부분 문자열 추출 (보조)
-            korean_text = re.sub(r'[^가-힣]', '', comment)
-            if len(korean_text) > 0:
-                # 2-4글자 길이의 부분 문자열 추출 (단어 경계 고려)
-                for length in range(2, min(5, len(korean_text) + 1)):  # 최대 4글자
-                    for i in range(len(korean_text) - length + 1):
-                        word = korean_text[i:i+length]
-                        if len(word) >= 2:
-                            all_words.append(word)
-        
-        # 빈도수 계산
-        word_counter = Counter(all_words)
-        
-        # 특수 용어는 우선 추가
-        for term in found_special_terms:
-            if term in word_counter:
-                word_counter[term] += 10  # 가중치 부여
-        
-        # 제외할 일반적인 단어들 및 어미/접미사
-        exclude_words = {
-            '좋아요', '맞아요', '수고', '공감', '정보', '감사', '고마워', '고마워요',
-            '좋아', '맞아', '그래', '그렇', '이거', '저거', '이것', '저것',
-            '때문', '때문에', '그래서', '그런데', '그리고', '하지만', '그러나',
-            '댓글', '게시글', '작성', '등록', '수정', '삭제', '신고',
-            '오늘', '내일', '어제', '지금', '이제', '그때', '언제',
-            '여기', '저기', '거기', '어디', '어디서', '어디에',
-            '이렇게', '저렇게', '그렇게', '어떻게', '왜', '무엇', '무슨',
-            '있어', '없어', '있네', '없네', '있어요', '없어요',
-            '되네', '되네요', '되나', '되나요', '되는', '되는데',
-            '가네', '가네요', '가나', '가나요', '가는', '가는데',
-            '하네', '하네요', '하나', '하나요', '하는', '하는데',
-            '보네', '보네요', '보나', '보나요', '보는', '보는데',
-            '먹네', '먹네요', '먹나', '먹나요', '먹는', '먹는데',
-            '드네', '드네요', '드나', '드나요', '드는', '드는데',
-            '해야', '해야지', '해야지', '해야', '해야', '해야',
-            # 어미 패턴 (강화)
-            '입니', '습니', '시다', '게맞', '게되', '게하', '시길', '하셨', '하셔', '하셨어',
-            '재밋', '재밌', '재밌습', '재밋습', '재밋니', '재밌니',
-            '맛담배', '담배하', '고생하', '화이팅해', '저도하고', '생각',
-            # 조사
-            '은', '는', '이', '가', '을', '를', '의', '에', '에서', '와', '과',
-            '도', '만', '조차', '까지', '부터', '에게', '한테', '께', '로', '으로',
-            '처럼', '같이', '만큼', '보다', '마다', '대로', '커녕',
-            # 의미 없는 단어
-            '아자', '하고', '하고싶', '하고프', '하고싶네', '하고프네',
-        }
-        
-        # 어미로 끝나는 패턴 (제외)
-        exclude_endings = (
-            '합니다', '니다', '네요', '해요', '이에요', '예요', '이네요', '이죠',
-            '이다', '입니다', '이야', '야', '어요', '아요', '지요', '죠',
-            '거예요', '거야', '거다', '되요', '돼요', '되네', '되나', '되는',
-            '될', '되면', '되니', '하네', '하나', '하는', '할', '하면',
-            '하니', '하죠', '하세요', '가요', '가네', '가는', '갈', '가면',
-            '가니', '가죠', '가세요', '와요', '와네', '오는', '올', '오면',
-            '오니', '오죠', '오세요', '있어', '있네', '있는', '있을', '있으면',
-            '있니', '있죠', '있어요', '없어', '없네', '없는', '없을', '없으면',
-            '없니', '없죠', '없어요', '좋아', '좋네', '좋은', '좋을', '좋으면',
-            '좋니', '좋죠', '좋아요', '나와', '나네', '나는', '날', '나면',
-            '나니', '나죠', '나와요', '보네', '보는', '볼', '보면', '보니',
-            '보죠', '보세요', '먹네', '먹는', '먹을', '먹으면', '먹니', '먹죠',
-            '먹어요', '하시', '하셔', '하신', '하실', '하시면', '하시니', '하시죠',
-            '는데', '은데', '인데', '거야', '거예요', '거다', '거네', '거네요',
-            '거나', '거나요', '거는', '거는데', '거니', '거니요', '거죠', '거세요',
-            '하셨', '하셔', '하셨어', '하시길', '하시길요', '하시길요',
-            '재밋', '재밌', '재밋습', '재밌습', '재밋니', '재밌니',
-            '시길', '시길요', '시길요요', '시길요요요',
-            '맛담배', '담배하', '고생하', '화이팅해', '저도하고',
-        )
-        
-        # 한글 어미/접미사 패턴 (중복 제거)
-        suffix_patterns = {
-            # 2글자 어미
-            '네요', '나요', '어요', '아요', '에요', '예요', '세요',
-            '네', '나', '어', '아', '에', '예', '세',
-            '는데', '은데', '인데',
-            '고요', '구요',
-            '지요', '죠',
-            '어야', '아야',
-            '거든', '거든요',
-            '더라', '더라고',
-            '던데', '던데요',
-            '는군', '는군요',
-            '는구', '는구나',
-            '는걸', '는걸요',
-            '는지', '는지요',
-            '을까', '을까요',
-            '을래', '을래요',
-            '을게', '을게요',
-            '습니다', '습니까',
-        }
-        
-        # 어미/접미사 제외 함수
-        def is_suffix(word: str) -> bool:
-            """단어가 어미/접미사인지 확인"""
-            # 정확히 일치하는 어미
-            if word in suffix_patterns:
-                return True
-            
-            # 어미 패턴으로 시작하거나 끝나는 경우
-            suffix_start_patterns = ['입니', '습니', '시다', '게맞', '게되', '게하', '게되', '게만', '게는', '게이', '게가']
-            if word.startswith(tuple(suffix_start_patterns)):
-                return True
-            
-            # 2-4글자 단어가 어미로 끝나는 경우 (의미 있는 단어가 아닌 경우)
-            if len(word) <= 4:
-                # 일반적인 어미 종결어미
-                suffix_endings = ['요', '네', '나', '어', '아', '에', '예', '세', '데', '죠', '까', '래', '게', '지', '군', '구', '걸', '라', '러', '로', '루', '르', '니', '다', '맞']
-                if word[-1] in suffix_endings:
-                    # 2글자이고 어미로 끝나는 경우
-                    if len(word) == 2:
-                        return True
-                    # 3-4글자이고 일반적인 어미 패턴인 경우
-                    if len(word) >= 3:
-                        # 3글자 어미 패턴
-                        if word[-2:] in ['네요', '나요', '어요', '아요', '에요', '예요', '세요', '는데', '은데', '인데', '는군', '는구', '는걸', '는지', '을까', '을래', '을게', '입니', '습니', '시다', '게맞']:
-                            return True
-                        # 4글자 어미 패턴
-                        if len(word) == 4 and word[-3:] in ['입니다', '습니다', '게맞다', '게되다', '게하다']:
-                            return True
-            
-            return False
-        
-        # 빈도수 높은 키워드 추출 (최소 2번 이상 나온 단어, 제외 단어 및 어미 제외)
-        keywords = []
-        for word, count in word_counter.most_common(30):  # 더 많이 확인
-            # 기본 조건 체크
-            if count < 2 or word in exclude_words or len(word) < 2:
-                continue
-            
-            # 어미로 끝나는지 체크
-            if word.endswith(exclude_endings):
-                continue
-            
-            # 어미로 시작하는 패턴 체크 (입니, 습니, 시다 등) - 강화
-            if word.startswith(('입니', '습니', '시다', '게맞', '게되', '게하', '시길', '하셨', '하셔', '재밋', '재밌')):
-                continue
-            
-            # 어미로 끝나는 패턴 체크 - 강화
-            if word.endswith(('하셨', '하셔', '하셨어', '시길', '시길요', '재밋', '재밌', '재밋습', '재밌습', '재밋니', '재밌니')):
-                continue
-            
-            # 최대 길이 제한 (4글자)
-            if len(word) > 4:
-                continue
-            
-            # is_suffix 함수로 체크
-            if is_suffix(word):
-                continue
-            
-            # 조사로 시작하거나 끝나는지 체크
-            if word.startswith(('은', '는', '이', '가', '을', '를', '의', '에', '에서', '와', '과', '도', '만')):
-                continue
-            if word.endswith(('은', '는', '이', '가', '을', '를', '의', '에', '에서', '와', '과', '도', '만')):
-                continue
-            
-            # 한글이 하나도 없는 키워드는 제외 (88, 16 같은 숫자만 있는 키워드 방지)
-            if not re.search(r'[가-힣]', word):
-                continue
-            
-            keywords.append(word)
-            if len(keywords) >= 10:  # 최대 10개
-                break
-        
-        # 중복 제거 (긴 단어가 짧은 단어를 포함하는 경우 긴 단어 우선)
-        filtered_keywords = []
-        for keyword in keywords:
-            is_substring = False
-            for other in keywords:
-                if keyword != other and keyword in other and len(other) > len(keyword):
-                    is_substring = True
-                    break
-            if not is_substring:
-                filtered_keywords.append(keyword)
-        
-        # 로그는 GUI에서만 표시
-        
-        return filtered_keywords[:3]  # 상위 3개만 반환
+        return valid_candidates[:8]
     
-    def _generate_with_actual_comments(self, title: str, content: str, actual_comments: List[str], keywords: List[str] = None, has_few_comments: bool = False) -> Optional[str]:
-        """실제 댓글을 모방하여 댓글 생성
+    def generate_comment(self, post_content: str, post_title: str = "", 
+                        actual_comments: List[str] = None,
+                        post_id: Optional[str] = None) -> Optional[str]:
+        """
+        댓글 생성 (메인 메서드)
+        - AI가 댓글 후보 8개 생성
+        - 후보 중에서 검증 통과한 것 중 하나 선택
         
         Args:
-            has_few_comments: 댓글이 적을 때(3개 이하) True. 본문 분석을 더 강화함.
+            post_content: 게시글 본문
+            post_title: 게시글 제목
+            actual_comments: 실제 댓글 목록 (AI에게 전달하여 참고)
+            post_id: 게시글 ID (게시글별 중복 방지용)
+        
+        Returns:
+            생성된 댓글 또는 None
         """
-        # 실제 댓글 목록 정리 (타입 안전하게 처리)
-        comments_list = []
-        for comment in actual_comments:
-            if isinstance(comment, str):
-                comment_text = comment
-            elif isinstance(comment, dict):
-                comment_text = comment.get('content', str(comment))
-            else:
-                comment_text = str(comment)
-            
-            if comment_text and len(comment_text.strip()) > 2:
-                comments_list.append(comment_text.strip())
+        # 주기적 핫리로드 체크
+        current_time = time.time()
+        if current_time - self.last_pool_reload >= self.hot_reload_interval:
+            self.reload_comment_pool()
+            self.last_pool_reload = current_time
         
-        if not comments_list:
+        # 주기적 통계 저장
+        self._save_stats()
+        
+        if not self.can_generate_comment(post_content):
+            self.stats['skipped'] += 1
+            self.stats_dirty = True
+            self._save_stats()
             return None
         
-        # 10자 이내 댓글만 필터링 (분석 및 모방용)
-        short_comments = [c for c in comments_list if len(c) <= 10]
-        if not short_comments:
-            # 10자 이내 댓글이 없으면 전체 댓글 사용
-            short_comments = comments_list
+        # 건승 키워드 감지
+        combined_text = (post_title + " " + post_content).lower()
+        has_geungseung = "건승" in combined_text
         
-        # 키워드 추출 (10자 이내 댓글에서 가장 많이 나온 단어) - 전달받지 않은 경우에만 추출
-        if keywords is None:
-            keywords = self._extract_keywords(short_comments, max_length=10)
-        
-        # System Prompt: 커뮤니티 스타일 반영 버전 (차갑고 공격적인 톤)
-        system_prompt = """너는 온라인 도박 커뮤니티 게시판에서 활동하는 평범한 유저다.  
-
-너의 역할은 이미 달려 있는 댓글들의 말투를 참고해서, 티 안 나는 자연스러운 한 줄 댓글을 다는 것이다.
-
-너는 기본적으로 정이 많거나 다정한 스타일이 아니고, 약간 냉소적이면서도 눈치 빠른 오래된 유저라는 느낌으로 말한다.
-
-[입력으로 주어지는 것]
-- 게시물 제목
-- 게시물 본문
-- 기존 댓글 목록
-- 키워드(단어 몇 개)
-
-[댓글 작성 규칙]
-
-1. 말투 스타일
-- 이 커뮤니티에서 자주 쓰는 말투와 분위기를 따라 한다.
-- 정자체보다 약간 흐트러진 채팅체/댓글체를 사용한다.
-- 예시 스타일: 나른하네영, 알딸딸하네염, 맛점ㄱㄱ싱, 고고링, 가즈아, 괴꿀맛, 맛도리, 개고우스트, 정배데이 ㅅㅅㅅ 등
-- 너무 교과서적인 표현("그렇군요.", "좋습니다.", "정말 안타깝네요." 등)은 피한다.
-- **너무 친절하고 따뜻한 말투("응원합니다", "힘내세요", "건강 조심하세요", "좋은 하루 되세요", "행복하세요", "파이팅입니다" 등)는 쓰지 말고, 약간 건조하거나 비꼬는 느낌이 섞인 반응을 선호한다.**
-- 상대를 챙겨주는 느낌보다는, "아 저런 일 있으면 빡치지" / "그건 인정" 정도의 거리를 두고 반응하는 톤으로 쓴다.
-- **너는 글쓴이와 친한 친구가 아니다. 불특정 다수 유저 중 한 명일 뿐이다.**
-- **그래서 상대에게 "그만 마시라니까", "정신 차려라", "적당히 해라" 같은 직접적인 훈수/잔소리/명령조는 웬만하면 쓰지 않는다.**
-- **글쓴이가 자기를 자학하거나 망한 내용을 써도, "함부로 훈수 두는 사람" 보다는 "옆에서 같이 구경하는 사람" 느낌으로 쓴다.**
-
-2. 종결어미/형태 다양화
-- 항상 "~네요", "~에요"로 끝내지 말고 아래를 섞어서 사용한다.
-- 사용 예:
-  - ~네요, ~네여, ~네영, ~군요, ~입니당, ~입니두, ~입니다영
-  - ~다 ㅠ, ~다 ㅋㅋ, ~구영, ~하네여, ~하네영, ~하네유
-  - 문장 끝에 ㅋㅋ, ㅎㅎ, ㅠㅠ, ㅜㅜ, ㄷㄷ, ㅅㅅ 등을 적당히 섞어서 사용
-- 종결어미와 이모티콘은 매번 조금씩 다르게 조합한다.
-- "~하세요", "~하시길", "~하시길 바랍니다", "~하시길 바래요"처럼 상대를 배려·격려하는 부탁형 어미는 웬만하면 쓰지 않는다.
-- **"고고", "ㄱㄱ", "가즈아", "무브" 같은 구호가 들어가면 그 단어들로 문장을 끝내고, 뒤에 "~하네여", "~하네영" 같은 말을 붙이지 않는다.**
-  - 예: "맛커담 고고하네영" (X) → "맛커담 고고~ ㅋㅋ" (O)
-- **"아이구궁", "허거덩", "헐" 같은 감탄사는 단독으로 쓰거나 짧게만 붙이고, 문장을 복잡하게 늘리지 않는다.**
-  - 예: "돌발은 진짜 아이구궁하네여" (X) → "돌발은 진짜 아이구궁이네여", "돌발은 진짜 아이구궁…" (O)
-
-3. 길이와 패턴
-- 댓글은 **한 줄만** 작성한다.
-- 너무 비슷한 길이로만 쓰지 말고 길이를 섞는다.
-  - 아주 짧게: 5~8자 정도 (예: "정배데이 ㅅㅅㅅ", "대승마렵다 ㅠ")
-  - 보통: 9~15자 정도
-  - 가끔 조금 길게: 16~25자 정도
-- 하나의 고정 패턴만 반복하지 말고, 문장 구조를 자주 바꾼다.
-  - 예: "~이네요" / "~네여" / "~네요 ㅋㅋ" / "~하네영 ㅠ" / "~가즈아~" 등
-
-4. 본문/상황 반영
-- 제목이나 본문에서 **핵심 단어 1~2개를 꼭 골라서** 댓글에 자연스럽게 섞는다.
-- 단순 리액션만 하지 말고, 글쓴이가 말한 상황을 한 번 더 짚어준다.
-  - 예: "포시세가 빡세다" → "포시세 진짜 너무 빡세네여 ㅠ"
-  - 예: "대출이자/고금리 하소연" → "대출이자 얘기 넘 공감되긴 하네여 ㅠ 진짜 빡셈"
-- 기존 댓글에서 자주 보이는 표현도 1개 정도 섞으면 좋다.
-- 다만, "행복하시길", "잘 되실 거예요" 같은 미래 응원·위로 문장은 쓰지 않는다.
-
-5. 감정 톤 맞추기
-- 분위기에 따라 톤을 조절하되, **"공감은 하지만 따뜻하게 보듬지는 않는"** 느낌으로 쓴다.
-  - 축하/당첨/대박: 
-    - 신난 톤이지만 질투/부러움도 같이 섞어준다.
-    - 예: "개부럽네여 ㅋㅋ", "와 이건 진짜 인정이다 ㄷㄷ", "이러니 못 끊죠 ㅋㅋ"
-  - 손실/망함/말아먹음/조작 의심:
-    - 공감 + 짜증/분노 톤.
-    - 예: "이건 진짜 개열받는 상황이네여...", "이러면 멘탈 나가죠 ㅠ", "이 정도면 갑질 맞네여 ㄹㅇ"
-  - 잡담/소소한 일상:
-    - 너무 따뜻하게 챙기기보단, 가볍게 비틀거나 툭 던지는 느낌.
-    - 예: "맥심은 국룰이죠 ㅋㅋ", "이 맛에 커피 마시긴 하나봅니다 ㅋㅋ"
-- 글쓴이가 힘들어하거나 멘탈이 무너진 글에는
-  - **'더 달려라/더 질러라/올인하자' 같은 표현은 쓰지 않는다.**
-  - "괜찮으실 거예요", "힘내세요" 같은 말도 하지 않고, 현실적인 공감만 짧게 해준다.
-    - 예: "이 정도면 쉬어야 하는 각이네여", "멘탈 터질만함 이건…"
-- **"응원합니다", "힘내세요", "파이팅입니다", "건강 챙기세요", "행복하세요", "좋은 하루 되세요" 같은 너무 따뜻한 위로 문장은 사용하지 않는다.**
-
-6. 커뮤니티 말투 요소
-- 아래 요소들을 적당히 섞되, 한 댓글 안에 너무 많이 넣지는 않는다.
-  - 의도적인 오타: 하네영, 하네여, 땡기네여, 괴꿀맛도리, 지립니다영 등
-  - 초성/반말 섞기: ㅅㅅㅅ, ㄷㄷ, ㅋㅋ, ㅎㅎ, ㅠㅠ, ㅜㅜ
-  - 짧은 감탄사: 헉, 크으, 캬, 와우, 우효, 레알 등
-- 동일한 단어를 너무 자주 반복하지 말고, 비슷한 의미라도 표현을 조금씩 바꿔 쓴다.
-
-7. 출력 형식
-- 출력은 **댓글 한 줄만** 작성한다.
-- 따옴표, 이모지(😊 이런 것), 설명 문구, 접두어("AI 댓글:") 등은 절대 쓰지 않는다.
-- 앞뒤에 공백이나 줄바꿈 없이, 그냥 댓글 내용만 출력한다.
-
-[금지 표현]
-- 아래 표현들은 절대 쓰지 않는다:
-  - "응원합니다", "힘내세요", "행복하세요", "건강 챙기세요",
-  - "좋은 하루 되세요", "평안하시길 바랍니다", "마음 추스리시길 바랍니다",
-  - "파이팅입니다", "화이팅입니다", "파이팅이에요", "화이팅이에요",
-  - "잘 되실 거예요", "잘 될 거에요", "괜찮아질 거예요"
-- 위와 비슷한 뉘앙스의 지나치게 따뜻하고 공손한 문장도 피한다.
-
-[중요 안전 규칙]
-- 글에서 "자살", "죽어라", "극단적 선택" 같은 표현이 나와도 그 단어들을 그대로 따라 쓰지 않는다.
-- 그런 표현을 동조하거나 부추기는 말은 절대 쓰지 않는다.
-- 대신 그 사람의 행동이나 사건을 비판하거나, 어이없음/분노/실망만 표현한다.
-  - 예: "진짜 노답인간이네여", "이건 선 넘은 거죠", "이 정도면 인간 말종급이네여" 등"""
-        
-        # User Prompt: 데이터 위주로 간소화
-        # 게시글 정보 간소화
-        post_info = ""
-        if title:
-            post_info += f"[게시글 제목]\n{title}\n\n"
-        if content:
-            content_preview = content[:300] + ("..." if len(content) > 300 else "")
-            post_info += f"[게시글 본문]\n{content_preview}\n\n"
-        
-        # 댓글 목록 간소화
-        comments_display = ""
-        if comments_list:
-            comments_display = "[이미 달린 댓글들]\n"
-            for i, c in enumerate(comments_list[:10], 1):  # 최대 10개만
-                comments_display += f"{i}. {c}\n"
-        
-        # 키워드 간소화
-        keywords_display = ""
-        if keywords:
-            keywords_display = f"\n[참고 키워드]\n- {', '.join(keywords[:5])}\n"
-        
-        user_prompt = f"""{post_info}{comments_display}{keywords_display}
-
-위 규칙을 모두 지키면서, 위에 주어지는 게시글/댓글 정보를 보고 커뮤니티 스타일에 맞는 자연스러운 한 줄 댓글만 출력해줘."""
-        
-        # API 호출
-        try:
-            # 로그 간소화
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.7,  # 다양성 향상을 위해 0.7로 상향 (0.6에서 조정)
-                max_tokens=40  # 길이 다양화(5~25자)를 위해 40토큰으로 상향
+        # 1단계: AI로 댓글 후보 8개 생성
+        candidates = []
+        if not self.force_pool_mode:
+            candidates = self._generate_comment_candidates(
+                post_content, post_title, actual_comments
             )
-            
-            if not response or not response.choices:
-                logger.error("API 응답이 비어있습니다.")
-                return None
-            
-            comment = response.choices[0].message.content.strip()
-            logger.debug(f"API 응답: '{comment}'")
-            return comment
-        except Exception as e:
-            logger.error(f"OpenAI API 호출 오류: {e}")
-            import traceback
-            logger.error(f"트레이스백: {traceback.format_exc()}")
-            return None
-    
-    def _post_process(self, comment: str) -> Optional[str]:
-        """댓글 후처리 - 간소화된 버전 (기본 정제만)"""
-        logger.debug(f"후처리 시작: '{comment}'")
+            logger.debug(f"생성된 댓글 후보: {len(candidates)}개")
         
-        comment = comment.strip()
+        # 건승 키워드가 있고 후보가 없으면 건승 풀에서 우선 선택
+        if has_geungseung and not candidates:
+            logger.debug("건승 키워드 감지: 건승 풀에서 우선 선택")
+            geungseung_comment = self._get_from_pool(
+                post_type='건승',
+                exclude_comments=[post_content] if post_content else None,
+                post_id=post_id
+            )
+            if geungseung_comment:
+                is_valid, failure_reason = self._validate_comment(geungseung_comment, check_duplicate=True, post_id=post_id)
+                if is_valid:
+                    self._add_to_history(geungseung_comment, post_id)
+                    self.stats['pool_used'] += 1
+                    self.stats['generated_total'] += 1
+                    self.stats_dirty = True
+                    self._save_stats()
+                    return geungseung_comment
         
-        # 한글(가-힣) + 자모(ㄱ-ㅎ, ㅏ-ㅣ) 중 아무거나 하나라도 있으면 통과
-        # ㅅㅅㅅ, ㄷㄷ, ㅋㅋ 같은 초성만 있는 댓글도 허용
-        if not re.search(r'[가-힣ㄱ-ㅎㅏ-ㅣ]', comment):
-            logger.warning(f"한글/자모가 없어서 필터링: '{comment}'")
-            return None
-        
-        # 이모티콘 제거
-        emoji_pattern = re.compile("["
-            u"\U0001F600-\U0001F64F"  # emoticons
-            u"\U0001F300-\U0001F5FF"  # symbols & pictographs
-            u"\U0001F680-\U0001F6FF"  # transport & map symbols
-            u"\U0001F1E0-\U0001F1FF"  # flags
-            u"\U00002702-\U000027B0"  # miscellaneous symbols
-            u"\U0001F900-\U0001F9FF"  # supplemental symbols
-            u"\U00002600-\U000026FF"  # miscellaneous symbols
-            "]+", flags=re.UNICODE)
-        comment = emoji_pattern.sub('', comment).strip()
-        
-        # 영어 제거 (선택적) - 커뮤니티에서 "bhc", "nba", "mlb" 등 알파벳 사용 가능하므로 주석 처리
-        # comment = re.sub(r'[a-zA-Z]', '', comment).strip()
-        
-        # 맨 앞 번호 제거 (예: "1. ", "2. ")
-        comment = re.sub(r'^\d+\.?\s*', '', comment).strip()
-        
-        # "고고하네영" 같이 어색한 패턴 정리
-        comment = re.sub(r'(고고|ㄱㄱ|가즈아|무브)(하네여|하네영)', r'\1', comment)
-        
-        # 너무 따뜻하거나 케어하는 뉘앙스 필터링
-        soft_phrases = [
-            "괜찮으실 거예요", "괜찮아질 거예요", "좋은 하루 되세요",
-            "행복하세요", "건강 챙기세요", "힘내세요", "응원합니다",
-            "잘 챙기세요", "필수죠", "하시면 좋겠어요", "추천드립니다",
-            "도움 되셨으면 좋겠어요", "괜찮으실 거예요", "잘 되실 거예요"
-        ]
-        for p in soft_phrases:
-            if p in comment:
-                logger.warning(f"너무 따뜻한 말투라 필터링: '{comment}'")
-                return None
-        
-        # 친분 있어야 할 수 있는 훈수/잔소리 톤 필터링
-        harsh_coach = [
-            "그만 마시라니까", "그만 마시라니깐", "그만 마셔라",
-            "정신차려라", "정신 차려라", "적당히 마셔요", "적당히 하세요",
-            "그만 좀 해라", "술 좀 줄이세요", "그만 마시", "정신 차리"
-        ]
-        for p in harsh_coach:
-            if p in comment:
-                logger.warning(f"훈수/잔소리 느낌이라 필터링: '{comment}'")
-                return None
-        
-        # 글자 수 제한 (2~26자) - 프롬프트의 다양성 요구(5~25자)와 맞춤
-        # ㅋㅋ, ㄷㄷ, ㅅㅅㅅ 같은 초성 리액션도 허용
-        if len(comment) < 2:
-            logger.warning(f"너무 짧은 댓글: '{comment}'")
-            return None
-        if len(comment) > 26:
-            trimmed = comment[:26]
-            # 단어 중간에서 잘렸으면 마지막 단어 하나 잘라내기
-            if ' ' in trimmed:
-                trimmed = trimmed.rsplit(' ', 1)[0].strip()
-            comment = trimmed
-        
-        logger.debug(f"후처리 완료: '{comment}' (길이: {len(comment)}자)")
-        return comment or None
-    
-    def _validate_not_duplicate(self, comment: str, actual_comments: List[str]) -> bool:
-        """생성된 댓글이 실제 댓글과 완전히 동일하거나 본문을 복사한지 확인 (완화된 버전)"""
-        if not actual_comments:
-            return True  # 실제 댓글이 없으면 검증 통과
-        
-        # 생성된 댓글에서 특수문자 제거하여 비교
-        comment_clean = re.sub(r'[~!?.,\s]', '', comment)
-        comment_clean_korean = re.sub(r'[^가-힣]', '', comment_clean)
-        
-        # 실제 댓글과 완전히 동일한 경우만 차단
-        for actual_comment in actual_comments:
-            if isinstance(actual_comment, str):
-                actual_text = actual_comment
-            elif isinstance(actual_comment, dict):
-                actual_text = actual_comment.get('content', str(actual_comment))
+        # 2단계: 후보 중에서 검증 통과한 것 필터링
+        valid_candidates = []
+        for candidate in candidates:
+            is_valid, failure_reason = self._validate_comment(
+                candidate, check_duplicate=True, post_id=post_id
+            )
+            if is_valid:
+                valid_candidates.append(candidate)
             else:
-                actual_text = str(actual_comment)
+                if failure_reason:
+                    logger.warning(f"후보 검증 실패: '{candidate}' (길이: {len(candidate.replace(' ', ''))}자) - {failure_reason.value}")
+        
+        # 3단계: 검증 통과한 후보 중에서 하나 선택
+        if valid_candidates:
+            # 중복 체크를 다시 한 번 수행 (히스토리와 비교)
+            final_candidates = []
+            for candidate in valid_candidates:
+                if not self._is_duplicate(candidate):
+                    final_candidates.append(candidate)
             
-            if not actual_text:
-                continue
-            
-            # 실제 댓글에서도 특수문자 제거하여 비교
-            actual_clean = re.sub(r'[~!?.,\s]', '', actual_text)
-            actual_clean_korean = re.sub(r'[^가-힣]', '', actual_clean)
-            
-            # 완전히 동일한 경우만 차단
-            if comment_clean_korean == actual_clean_korean:
-                logger.debug(f"실제 댓글과 완전히 동일: '{comment}' == '{actual_text}'")
-                return False
-        
-        # 본문/제목 완전 복사만 차단
-        if hasattr(self, '_current_post_content') and self._current_post_content:
-            post_content = self._current_post_content
-            post_title = getattr(self, '_current_post_title', '') or ''
-            post_full = f"{post_title} {post_content}"
-            post_clean = re.sub(r'[~!?.,\s]', '', post_full)
-            post_clean_korean = re.sub(r'[^가-힣]', '', post_clean)
-            
-            if len(comment_clean_korean) > 0 and len(post_clean_korean) > 0:
-                # 댓글이 본문/제목과 완전히 동일한 경우만 차단
-                if comment_clean_korean == post_clean_korean:
-                    logger.debug(f"본문과 완전히 동일: '{comment}'")
-                    return False
-                
-                # 댓글이 본문/제목의 일부를 그대로 복사한 경우 (댓글 길이가 본문의 50% 이상이면 복사로 간주)
-                if len(comment_clean_korean) >= len(post_clean_korean) * 0.5:
-                    if comment_clean_korean in post_clean_korean:
-                        logger.debug(f"본문 단순 복사 감지: '{comment}'")
-                        return False
-        
-        return True  # 통과
-    
-    def _validate_keywords_in_comment(self, comment: str, keywords: List[str]) -> bool:
-        """생성된 댓글에 키워드가 포함되어 있는지 확인 (완화된 버전: 1개 이상 포함이면 통과)"""
-        if not keywords:
-            return True  # 키워드가 없으면 검증 통과
-        
-        comment_korean = re.sub(r'[^가-힣]', '', comment)
-        
-        # 포함된 키워드 개수 확인
-        included_keywords = []
-        for keyword in keywords:
-            # 키워드에 한글이 있으면 한글만 비교
-            if re.search(r'[가-힣]', keyword):
-                if keyword in comment_korean:
-                    included_keywords.append(keyword)
-            else:
-                # 숫자/영문 등은 원문 기준 검색
-                if keyword in comment:
-                    included_keywords.append(keyword)
-        
-        # 키워드가 최소 1개 이상 포함되면 통과
-        if len(included_keywords) >= 1:
-            return True
-        
-        # 키워드가 하나도 없으면 실패
-        return False
-    
-    def _safe_string(self, text: str) -> str:
-        """안전한 문자열 처리"""
-        if not text:
-            return ""
-        
-        try:
-            if isinstance(text, bytes):
-                text = text.decode('utf-8', errors='ignore')
-            else:
-                text = str(text).encode('utf-8', errors='ignore').decode('utf-8')
-            
-            # 제어 문자 제거
-            text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\r\t')
-            return text
-        except:
-            return str(text) if text else ""
-    
-    def _log_generation(self, title: str, content: str, actual_comments: List[str], generated_comment: str):
-        """디버그 로그 기록"""
-        try:
-            debug_log_file = "ai_debug_log.txt"
-            with open(debug_log_file, 'a', encoding='utf-8') as f:
-                f.write("\n" + "="*80 + "\n")
-                f.write(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] AI 댓글 생성\n")
-                f.write("="*80 + "\n\n")
-                
-                f.write("【게시글 제목】\n")
-                f.write(f"{title if title else '(제목 없음)'}\n\n")
-                
-                f.write("【게시글 본문】\n")
-                content_preview = content[:500] if content else "(본문 없음)"
-                f.write(f"{content_preview}\n")
-                if content and len(content) > 500:
-                    f.write(f"... (전체 {len(content)}자 중 500자만 표시)\n")
-                f.write("\n")
-                
-                f.write("【게시글의 실제 댓글 목록】\n")
-                if actual_comments and len(actual_comments) > 0:
-                    f.write(f"총 {len(actual_comments)}개의 댓글이 있습니다:\n")
-                    for i, comment in enumerate(actual_comments, 1):
-                        if isinstance(comment, str):
-                            comment_text = comment
-                        elif isinstance(comment, dict):
-                            comment_text = comment.get('content', str(comment))
-                        else:
-                            comment_text = str(comment)
-                        f.write(f"  {i}. {comment_text}\n")
+            if final_candidates:
+                # 건승 키워드가 있으면 건승 관련 댓글 우선 선택
+                if has_geungseung:
+                    geungseung_candidates = [c for c in final_candidates if '건승' in c]
+                    if geungseung_candidates:
+                        comment = random.choice(geungseung_candidates)
+                        logger.debug(f"건승 관련 댓글 선택: {comment}")
+                    else:
+                        comment = random.choice(final_candidates)
                 else:
-                    f.write("(이 게시글에는 댓글이 없습니다)\n")
-                f.write("\n")
+                    comment = random.choice(final_candidates)
                 
-                f.write("【AI가 생성한 댓글】\n")
-                f.write(f"{generated_comment}\n")
-                f.write("\n" + "="*80 + "\n\n")
-        except Exception as e:
-            logger.debug(f"디버그 로그 기록 오류: {e}")
+                self._add_to_history(comment, post_id)
+                self.stats['gpt_used'] += 1
+                self.stats['generated_total'] += 1
+                self.stats_dirty = True
+                self._save_stats()
+                logger.debug(f"최종 선택된 댓글: {comment}")
+                return comment
+        
+        # 4단계: AI 생성 실패 시 풀에서 선택 (fallback)
+        logger.debug("AI 생성 실패, 풀 모드로 전환")
+        
+        # 건승 키워드가 있으면 건승 풀 우선 사용
+        if has_geungseung:
+            logger.debug("건승 키워드 감지: 건승 풀 우선 사용")
+            comment = self._get_from_pool(
+                post_type='건승',
+                exclude_comments=[post_content] if post_content else None,
+                post_id=post_id
+            )
+            if comment:
+                is_valid, failure_reason = self._validate_comment(comment, check_duplicate=True, post_id=post_id)
+                if is_valid:
+                    self._add_to_history(comment, post_id)
+                    return comment
+        
+        # 휴리스틱으로 유형 판단
+        fallback_type = self._detect_post_type_heuristic(post_content, post_title)
+        logger.debug(f"Fallback 유형 판단: {fallback_type}")
+        comment = self._get_from_pool(
+            post_type=fallback_type,
+            exclude_comments=[post_content] if post_content else None,
+            post_id=post_id
+        )
+        
+        if comment:
+            is_valid, failure_reason = self._validate_comment(comment, check_duplicate=True, post_id=post_id)
+            if is_valid:
+                self._add_to_history(comment, post_id)
+                return comment
+            else:
+                if failure_reason:
+                    self._record_failure(failure_reason)
+                    logger.warning(f"풀에서 가져온 댓글 검증 실패: {comment} - {failure_reason.value}")
+        
+        # 모든 방법 실패
+        self.stats['skipped'] += 1
+        self.stats_dirty = True
+        self._save_stats(force=True)
+        logger.warning("댓글 생성 실패: 모든 방법 시도 완료")
+        return None
     
-    def can_generate_comment(self, post_content: str) -> bool:
-        """게시글 내용이 댓글 생성 가능한지 판단"""
-        try:
-            if not post_content:
-                return False
-            
-            safe_content = self._safe_string(post_content)
-            if len(safe_content.strip()) < 10:
-                return False
-            
-            return True
-        except:
-            return False
+    def add_to_blacklist(self, comment: str):
+        """블랙리스트에 추가"""
+        self.blacklist.add(comment.strip())
+        self._save_comment_pool()
+        logger.info(f"블랙리스트 추가: {comment}")
+    
+    def get_stats(self) -> Dict:
+        """통계 정보 반환"""
+        stats = self.stats.copy()
+        stats['failure_reasons'] = self.failure_reasons.copy()
+        stats['api_usage'] = self.api_usage.copy()
+        stats['force_pool_mode'] = self.force_pool_mode
+        return stats
+    
+    def reset_history(self):
+        """히스토리 초기화"""
+        self.comment_history.clear()
+        self.post_comment_map.clear()
+        logger.info("댓글 히스토리 초기화")
+    
+    def save_stats_now(self):
+        """통계 즉시 저장 (프로그램 종료 시 호출)"""
+        self._save_stats(force=True)

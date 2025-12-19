@@ -26,14 +26,27 @@ class OncaPanScraperSelenium:
         self.free_board_url = f"{self.base_url}/bbs/free"
         self.test_mode = test_mode
         
-        # Chrome 옵션 설정
+        # Chrome 옵션 설정 (보안검증 우회 강화)
         chrome_options = Options()
         # headless 모드 비활성화 (Cloudflare 우회를 위해 필요)
         # chrome_options.add_argument('--headless')  # 필요시 주석 해제
+        
+        # 자동화 감지 방지 (강화)
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        # excludeSwitches는 undetected-chromedriver와 호환성 문제가 있을 수 있으므로
+        # undetected-chromedriver 사용 시에는 제외하고, 일반 Selenium 사용 시에만 추가
+        # chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        
+        # 최신 User-Agent 사용
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
+        
+        # 추가 보안검증 우회 옵션
+        chrome_options.add_argument('--disable-web-security')
+        chrome_options.add_argument('--allow-running-insecure-content')
+        chrome_options.add_argument('--disable-features=IsolateOrigins,site-per-process')
+        chrome_options.add_argument('--disable-site-isolation-trials')
+        
         # 빠른 시작을 위한 옵션
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
@@ -41,10 +54,21 @@ class OncaPanScraperSelenium:
         chrome_options.add_argument('--disable-extensions')
         chrome_options.add_argument('--disable-plugins')
         chrome_options.add_argument('--disable-images')  # 이미지 로딩 비활성화로 속도 향상
+        
+        # 언어 및 지역 설정 (한국어)
+        chrome_options.add_argument('--lang=ko-KR')
+        chrome_options.add_argument('--accept-lang=ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7')
+        
         chrome_options.add_experimental_option('prefs', {
             'profile.default_content_setting_values': {
-                'images': 2  # 이미지 차단
-            }
+                'images': 2,  # 이미지 차단
+                'notifications': 2,  # 알림 차단
+                'geolocation': 2,  # 위치 차단
+            },
+            'profile.managed_default_content_settings': {
+                'images': 2
+            },
+            'intl.accept_languages': 'ko-KR,ko,en-US,en'
         })
         
         try:
@@ -88,13 +112,66 @@ class OncaPanScraperSelenium:
                         except Exception as cleanup_error:
                             logger.debug(f"캐시 정리 중 오류 (무시): {cleanup_error}")
                     
-                    # ChromeDriverManager 설치 시도
+                    # undetected-chromedriver 사용 시도 (보안검증 우회에 가장 효과적)
+                    try:
+                        import undetected_chromedriver as uc
+                        # undetected-chromedriver는 자체적으로 옵션을 처리하므로
+                        # 호환성 문제가 있는 옵션은 제거하고 사용
+                        uc_options = Options()
+                        # 기본 옵션만 유지 (excludeSwitches 제외)
+                        uc_options.add_argument('--disable-blink-features=AutomationControlled')
+                        uc_options.add_argument('--no-sandbox')
+                        uc_options.add_argument('--disable-dev-shm-usage')
+                        uc_options.add_argument('--disable-gpu')
+                        uc_options.add_argument('--disable-images')
+                        uc_options.add_argument('--lang=ko-KR')
+                        uc_options.add_argument('--accept-lang=ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7')
+                        uc_options.add_experimental_option('prefs', {
+                            'profile.default_content_setting_values': {
+                                'images': 2,
+                                'notifications': 2,
+                                'geolocation': 2,
+                            },
+                            'intl.accept_languages': 'ko-KR,ko,en-US,en'
+                        })
+                        self.driver = uc.Chrome(options=uc_options, version_main=None)
+                        driver_initialized = True
+                        logger.info("ChromeDriver 초기화 성공 (undetected-chromedriver 사용 - 보안검증 우회 강화)")
+                        break
+                    except ImportError:
+                        logger.debug("undetected-chromedriver를 사용할 수 없습니다. 일반 Selenium 사용")
+                        # undetected-chromedriver가 없으면 일반 Selenium 사용
+                        pass
+                    except Exception as uc_error:
+                        logger.warning(f"undetected-chromedriver 초기화 실패: {uc_error}, 일반 Selenium으로 전환")
+                        pass
+                    
+                    # 일반 ChromeDriverManager 설치 시도 (undetected-chromedriver 실패 시)
                     try:
                         driver_path = ChromeDriverManager().install()
                         service = Service(driver_path)
                         self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                        
+                        # 자동화 감지 방지 스크립트 추가
+                        self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                            'source': '''
+                                Object.defineProperty(navigator, 'webdriver', {
+                                    get: () => undefined
+                                });
+                                window.navigator.chrome = {
+                                    runtime: {}
+                                };
+                                Object.defineProperty(navigator, 'plugins', {
+                                    get: () => [1, 2, 3, 4, 5]
+                                });
+                                Object.defineProperty(navigator, 'languages', {
+                                    get: () => ['ko-KR', 'ko', 'en-US', 'en']
+                                });
+                            '''
+                        })
+                        
                         driver_initialized = True
-                        logger.info("ChromeDriver 초기화 성공 (webdriver-manager 사용)")
+                        logger.info("ChromeDriver 초기화 성공 (webdriver-manager 사용 + 자동화 감지 방지)")
                         break
                     except (PermissionError, OSError) as perm_error:
                         error_msg = str(perm_error)
@@ -158,10 +235,21 @@ class OncaPanScraperSelenium:
                 self.driver.get(self.login_url)
                 time.sleep(1)  # 페이지 로딩 대기 시간 줄임
                 
-                # Cloudflare 체크 대기
-                if "cloudflare" in self.driver.page_source.lower() or "challenge" in self.driver.page_source.lower():
-                    logger.info("Cloudflare 체크 대기 중... (최대 10초)")
-                    time.sleep(10)
+                # Cloudflare 체크 대기 (더 긴 대기 시간)
+                page_source_lower = self.driver.page_source.lower()
+                if "cloudflare" in page_source_lower or "challenge" in page_source_lower or "checking your browser" in page_source_lower:
+                    logger.info("Cloudflare 체크 대기 중... (최대 15초)")
+                    # Cloudflare가 자동으로 통과할 때까지 대기
+                    max_wait = 15
+                    waited = 0
+                    while waited < max_wait:
+                        time.sleep(2)
+                        waited += 2
+                        current_source = self.driver.page_source.lower()
+                        if "cloudflare" not in current_source and "challenge" not in current_source and "checking your browser" not in current_source:
+                            logger.info("Cloudflare 체크 통과 완료")
+                            break
+                    time.sleep(2)  # 추가 안정화 대기
                 
                 # 로그인 폼 찾기
                 try:
@@ -292,11 +380,114 @@ class OncaPanScraperSelenium:
             posts = []
             seen_ids = set()
             now = datetime.now()
-            max_pages = 50  # 최대 탐색 페이지 수 (무한 루프 방지)
-            page = 1
+            cutoff_time = now - timedelta(hours=24)  # 24시간 전 시간
+            max_pages = 200  # 최대 탐색 페이지 수 증가
             found_old_post = False  # 24시간 초과 게시글 발견 여부
             
-            while page <= max_pages and not found_old_post:
+            # 이진 탐색으로 24시간 경계 페이지 찾기
+            # 먼저 큰 단위로 건너뛰면서 24시간 경계를 찾음
+            logger.info(f"24시간 경계 찾기 시작 (현재 시간: {now.strftime('%Y-%m-%d %H:%M')}, 기준 시간: {cutoff_time.strftime('%Y-%m-%d %H:%M')})")
+            
+            # 1페이지부터 시작하여 24시간 경계 찾기
+            page = 1
+            start_page = 1
+            end_page = None
+            
+            # 먼저 1페이지 확인
+            self.driver.get(self.free_board_url)
+            try:
+                WebDriverWait(self.driver, 3).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "table"))
+                )
+            except:
+                time.sleep(0.3)
+            
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            
+            # 페이지네이션에서 마지막 페이지 번호 찾기
+            try:
+                pg_links = soup.find_all('a', class_='pg_page', href=True)
+                if pg_links:
+                    # 맨끝 링크에서 페이지 번호 추출
+                    end_link = soup.find('a', class_='pg_end', href=True)
+                    if end_link:
+                        href = end_link.get('href', '')
+                        # /p{번호} 패턴에서 번호 추출
+                        import re
+                        match = re.search(r'/p(\d+)', href)
+                        if match:
+                            end_page = int(match.group(1))
+                            logger.info(f"마지막 페이지 발견: {end_page}")
+            except:
+                pass
+            
+            # 큰 단위로 건너뛰면서 24시간 경계 찾기
+            if end_page and end_page > 10:
+                # 이진 탐색으로 24시간 경계 찾기
+                left = 1
+                right = min(end_page, 200)
+                boundary_page = None
+                
+                while left <= right:
+                    mid = (left + right) // 2
+                    logger.debug(f"이진 탐색: 페이지 {mid} 확인 (범위: {left}-{right})")
+                    
+                    page_url = f"{self.free_board_url}/p{mid}"
+                    self.driver.get(page_url)
+                    try:
+                        WebDriverWait(self.driver, 3).until(
+                            EC.presence_of_element_located((By.TAG_NAME, "table"))
+                        )
+                    except:
+                        time.sleep(0.3)
+                    
+                    soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                    table = soup.find('table')
+                    if not table:
+                        right = mid - 1
+                        continue
+                    
+                    rows = table.find_all('tr')
+                    has_24h_post = False
+                    has_old_post = False
+                    
+                    for row in rows:
+                        if 'bo_notice' in row.get('class', []):
+                            continue
+                        
+                        datetime_cell = row.find('td', class_='td_datetime')
+                        if datetime_cell:
+                            post_datetime_str = datetime_cell.get_text(strip=True)
+                            parsed_dt = self._parse_datetime(post_datetime_str, now)
+                            if parsed_dt:
+                                if parsed_dt >= cutoff_time:
+                                    has_24h_post = True
+                                else:
+                                    has_old_post = True
+                    
+                    if has_24h_post and not has_old_post:
+                        # 이 페이지는 모두 24시간 이내, 더 뒤로 가야 함
+                        left = mid + 1
+                    elif has_old_post:
+                        # 이 페이지에 24시간 초과 게시글이 있음, 더 앞으로 가야 함
+                        boundary_page = mid
+                        right = mid - 1
+                    else:
+                        # 24시간 이내 게시글이 없음, 더 앞으로
+                        right = mid - 1
+                
+                if boundary_page:
+                    start_page = boundary_page
+                    logger.info(f"24시간 경계 페이지 발견: {start_page}페이지부터 탐색 시작")
+                else:
+                    logger.info("24시간 경계를 찾지 못함, 1페이지부터 탐색")
+            
+            # 경계 페이지부터 역순으로 탐색 (오래된 것부터)
+            # 경계 페이지부터 1페이지까지 역순으로 탐색
+            # 이렇게 하면 오래된 게시글부터 최신 게시글까지 순차적으로 수집됨
+            page = start_page
+            
+            while page >= 1:
                 # 페이지 URL 구성
                 if page == 1:
                     page_url = self.free_board_url
@@ -304,49 +495,70 @@ class OncaPanScraperSelenium:
                     current_url = self.driver.current_url
                     if self.free_board_url not in current_url:
                         self.driver.get(page_url)
-                        time.sleep(0.5)
+                        try:
+                            WebDriverWait(self.driver, 3).until(
+                                EC.presence_of_element_located((By.TAG_NAME, "table"))
+                            )
+                        except:
+                            time.sleep(0.3)
                 else:
                     # 페이지네이션 링크 찾기 (이전 페이지의 soup 사용)
                     try:
                         # 다양한 페이지네이션 패턴 시도
                         next_page_link = None
                         
-                        # 방법 1: 페이지 번호 링크 찾기
+                        # 방법 1: 페이지 번호 링크 찾기 (pg_page 클래스 사용)
                         if 'soup' in locals():
-                            page_links = soup.find_all('a', href=True)
+                            # pg_page 클래스를 가진 링크 중 페이지 번호와 일치하는 것 찾기
+                            page_links = soup.find_all('a', class_='pg_page', href=True)
                             for link in page_links:
                                 link_text = link.get_text(strip=True)
                                 href = link.get('href', '')
                                 # 페이지 번호와 일치하는 링크 찾기
-                                if link_text == str(page) or (f'page={page}' in href or f'/page/{page}' in href or f'/{page}' in href):
+                                if link_text == str(page):
                                     next_page_link = href
+                                    logger.debug(f"페이지 {page} 링크 발견: {href}")
                                     break
                             
-                            # 방법 2: 다음 페이지 버튼 찾기
+                            # 방법 2: href에 /p{page} 패턴이 있는 링크 찾기
                             if not next_page_link:
-                                next_buttons = soup.find_all('a', string=lambda x: x and ('다음' in str(x) or '>' in str(x) or 'next' in str(x).lower()))
+                                for link in page_links:
+                                    href = link.get('href', '')
+                                    if f'/p{page}' in href or f'/p{page}/' in href:
+                                        next_page_link = href
+                                        logger.debug(f"페이지 {page} 패턴 매칭: {href}")
+                                        break
+                            
+                            # 방법 3: 다음 페이지 버튼 찾기 (pg_next 클래스) - 첫 번째 다음 버튼만 사용
+                            if not next_page_link and page == 2:
+                                next_buttons = soup.find_all('a', class_='pg_next', href=True)
                                 if next_buttons:
                                     next_page_link = next_buttons[0].get('href', '')
+                                    logger.debug(f"다음 페이지 버튼 발견: {next_page_link}")
                         
-                        # 방법 3: URL 파라미터로 직접 구성
+                        # 방법 4: URL 패턴으로 직접 구성 (온카판 구조: /bbs/free/p{page})
+                        # 항상 이 방법을 사용하여 안정적으로 페이지 이동
                         if not next_page_link:
-                            if '?' in self.free_board_url:
-                                page_url = f"{self.free_board_url}&page={page}"
-                            else:
-                                page_url = f"{self.free_board_url}?page={page}"
+                            # 온카판 페이지네이션 패턴: /bbs/free/p2, /bbs/free/p3 등
+                            page_url = f"{self.free_board_url}/p{page}"
+                            logger.info(f"페이지 {page}로 이동: {page_url}")
                         else:
                             page_url = next_page_link if next_page_link.startswith('http') else f"{self.base_url}{next_page_link}"
+                            logger.info(f"페이지네이션 링크 사용: {page_url}")
                     except Exception as e:
                         logger.debug(f"페이지 {page} URL 구성 실패: {e}")
-                        # 기본 URL 파라미터 방식 사용
-                        if '?' in self.free_board_url:
-                            page_url = f"{self.free_board_url}&page={page}"
-                        else:
-                            page_url = f"{self.free_board_url}?page={page}"
+                        # 기본 URL 패턴 사용 (온카판 구조)
+                        page_url = f"{self.free_board_url}/p{page}"
                 
                 try:
                     self.driver.get(page_url)
-                    time.sleep(0.5)  # 페이지 로딩 대기
+                    # 페이지 로딩 최적화: 테이블이 나타날 때까지만 대기
+                    try:
+                        WebDriverWait(self.driver, 3).until(
+                            EC.presence_of_element_located((By.TAG_NAME, "table"))
+                        )
+                    except:
+                        time.sleep(0.3)  # 최소 대기
                     
                     # 페이지 소스 가져오기
                     soup = BeautifulSoup(self.driver.page_source, 'html.parser')
@@ -384,13 +596,14 @@ class OncaPanScraperSelenium:
                         if post_datetime_str:
                             parsed_dt = self._parse_datetime(post_datetime_str, now)
                             if parsed_dt:
-                                time_diff = now - parsed_dt
-                                if time_diff <= timedelta(hours=24):
+                                # 24시간 전 시간(cutoff_time)과 비교
+                                if parsed_dt >= cutoff_time:
                                     is_within_24h = True
                                 else:
                                     # 24시간 초과 게시글 발견
                                     # 이 페이지 이후는 더 오래된 게시글만 있으므로 탐색 중단
                                     found_old_post = True
+                                    logger.debug(f"24시간 초과 게시글 발견: {post_datetime_str} (기준: {cutoff_time.strftime('%Y-%m-%d %H:%M')})")
                         
                         if title and len(title) > 5:
                             if '/bbs/free' in href or 'wr_id=' in href or 'board.php' in href:
@@ -400,8 +613,7 @@ class OncaPanScraperSelenium:
                                     full_url = href if href.startswith('http') else f"{self.base_url}{href}"
                                     
                                     # 24시간 이내 게시글만 추가
-                                    if is_within_24h or (not post_datetime_str and page == 1):
-                                        # 날짜가 없는 경우 첫 페이지에서만 추가 (안전장치)
+                                    if is_within_24h:
                                         posts.append({
                                             'id': post_id,
                                             'title': title,
@@ -410,33 +622,61 @@ class OncaPanScraperSelenium:
                                             'datetime_obj': parsed_dt,  # 정렬용
                                         })
                                         page_has_valid_posts = True
+                                    elif parsed_dt and parsed_dt < cutoff_time:
+                                        # 24시간 초과 게시글 발견
+                                        # 역순 탐색이므로 이 페이지 이후는 더 최신 게시글만 있음
+                                        # 하지만 역순이므로 이미 처리한 페이지들이 더 오래된 것
+                                        found_old_post = True
                     
-                    # 이 페이지에서 유효한 게시글이 없고, 24시간 초과 게시글을 발견했다면 탐색 중단
-                    if not page_has_valid_posts and found_old_post:
+                    # 역순 탐색이므로 24시간 초과 게시글을 발견하면 더 이상 탐색할 필요 없음
+                    # (이미 더 오래된 게시글들을 수집했으므로)
+                    if found_old_post:
+                        logger.info(f"24시간 초과 게시글 발견, 탐색 중단 (현재 페이지: {page})")
                         break
                     
                     # 이 페이지에서 게시글을 찾지 못했다면 더 이상 페이지가 없는 것으로 간주
-                    if not page_has_valid_posts and page > 1:
+                    if not page_has_valid_posts and page < start_page:
                         break
                     
-                    page += 1
+                    page -= 1  # 역순으로 탐색 (오래된 것부터)
+                    
+                    # 진행 상황 로그
+                    if page % 10 == 0 or page == 1:
+                        logger.info(f"페이지 탐색 진행: {page}페이지 (수집된 게시글: {len(posts)}개)")
                     
                 except Exception as e:
                     logger.debug(f"페이지 {page} 탐색 오류: {e}")
                     break
             
-            # 날짜순으로 정렬 (오래된 것부터 = 역순)
+            # 날짜순으로 정렬 (오래된 것부터 = 오름차순)
             # datetime_obj가 None이 아닌 것만 정렬하고, None인 것은 뒤로
-            posts_with_date = [p for p in posts if p.get('datetime_obj')]
-            posts_without_date = [p for p in posts if not p.get('datetime_obj')]
+            posts_with_date = [p for p in posts if p.get('datetime_obj') is not None]
+            posts_without_date = [p for p in posts if p.get('datetime_obj') is None]
             
-            # datetime 기준 오름차순 정렬 (오래된 것부터)
-            posts_with_date.sort(key=lambda x: x.get('datetime_obj') or datetime.min)
+            # datetime 기준 오름차순 정렬 (오래된 것부터 최신 것까지)
+            # datetime 객체를 직접 비교하여 정확하게 정렬
+            posts_with_date.sort(key=lambda x: x.get('datetime_obj'))
             
             # 최종: 오래된 것부터 먼저, 날짜 없는 것은 뒤로
             sorted_posts = posts_with_date + posts_without_date
             
-            logger.info(f"게시글 {len(sorted_posts)}개 가져옴 (24시간 이내만, {page-1}페이지 탐색, 오래된 것부터)")
+            # 정렬 확인 로그 (처음 3개와 마지막 3개)
+            if len(sorted_posts) > 0:
+                first_3 = sorted_posts[:min(3, len(sorted_posts))]
+                last_3 = sorted_posts[-min(3, len(sorted_posts)):]
+                first_dates = [p.get('datetime', '날짜 없음') for p in first_3]
+                last_dates = [p.get('datetime', '날짜 없음') for p in last_3]
+                logger.info(f"정렬 확인 - 첫 3개: {first_dates}")
+                logger.info(f"정렬 확인 - 마지막 3개: {last_dates}")
+                
+                # 24시간 범위 확인
+                if posts_with_date:
+                    oldest = posts_with_date[0].get('datetime_obj')
+                    newest = posts_with_date[-1].get('datetime_obj')
+                    if oldest and newest:
+                        logger.info(f"24시간 범위: {oldest.strftime('%Y-%m-%d %H:%M')} ~ {newest.strftime('%Y-%m-%d %H:%M')} (현재: {now.strftime('%Y-%m-%d %H:%M')})")
+            
+            logger.info(f"게시글 {len(sorted_posts)}개 가져옴 (24시간 이내만, 경계 페이지 {start_page}부터 1페이지까지 탐색, 오래된 것부터)")
             return sorted_posts
             
         except Exception as e:
@@ -450,15 +690,45 @@ class OncaPanScraperSelenium:
             
             datetime_str = datetime_str.strip()
             
-            # "HH:MM" 형식 (오늘)
+            # "HH:MM" 형식 (오늘 또는 어제)
             time_match = re.match(r'(\d{1,2}):(\d{2})', datetime_str)
             if time_match:
                 hour = int(time_match.group(1))
                 minute = int(time_match.group(2))
+                
+                # 오늘 같은 시간으로 먼저 설정
                 post_datetime = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                # 오늘이 아니면 어제로 간주
+                
+                # 24시간 기준 시간 계산
+                cutoff_time = now - timedelta(hours=24)
+                
+                # 현재 시간보다 미래면 어제로 간주
                 if post_datetime > now:
                     post_datetime = post_datetime - timedelta(days=1)
+                
+                # 24시간 전보다 오래되었으면 어제로 간주
+                # 단, 자정 00시는 특별 처리: 현재 시간이 17시라면 00시는 어제 자정이 아니라 오늘 자정일 수 있음
+                # 하지만 24시간 기준으로 판단해야 함
+                if post_datetime < cutoff_time:
+                    # 어제 같은 시간으로 설정
+                    post_datetime = post_datetime - timedelta(days=1)
+                    # 여전히 24시간 전보다 오래되었으면 더 이전으로
+                    if post_datetime < cutoff_time:
+                        # 이 경우는 매우 오래된 게시글이므로 그대로 반환
+                        pass
+                
+                # 자정 00시 특별 처리: 자정 00시 게시글이 현재 시간보다 오래되었고
+                # 24시간 전보다 오래되었으면 어제 자정으로 인식
+                if hour == 0 and minute == 0:
+                    # 자정 00시는 어제 자정일 가능성이 높음 (특히 오래된 페이지에서)
+                    # 하지만 정확한 판단을 위해 24시간 기준으로 확인
+                    if post_datetime < cutoff_time:
+                        # 이미 어제로 설정되었을 수 있지만, 한 번 더 확인
+                        yesterday_midnight = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                        if yesterday_midnight >= cutoff_time:
+                            # 어제 자정이 24시간 이내면 어제 자정으로 설정
+                            post_datetime = yesterday_midnight
+                
                 return post_datetime
             
             # "MM-DD" 형식 (올해)
@@ -799,6 +1069,312 @@ class OncaPanScraperSelenium:
                     pass
             
             logger.error(f"댓글 작성 오류: {e}")
+            return False
+    
+    def click_like(self, post_url: str) -> bool:
+        """
+        게시글 좋아요 버튼 클릭
+        
+        Args:
+            post_url: 게시글 URL
+        
+        Returns:
+            좋아요 클릭 성공 여부
+        """
+        if self.test_mode:
+            logger.info(f"[테스트 모드] 좋아요 클릭 시뮬레이션: {post_url}")
+            logger.debug(f"test_mode={self.test_mode}, 실제 클릭하지 않음")
+            return True
+        
+        logger.debug(f"실제 모드: 좋아요 클릭 시작 - test_mode={self.test_mode}, URL={post_url}")
+        
+        try:
+            # 항상 해당 게시글 페이지로 이동 (명시적으로 이동)
+            # URL 정규화 (슬래시 제거 등)
+            normalized_post_url = post_url.strip().rstrip('/')
+            current_url = self.driver.current_url.strip().rstrip('/')
+            
+            # URL에서 게시글 ID 추출하여 비교
+            post_id_from_url = self._extract_post_id(post_url)
+            current_post_id = self._extract_post_id(current_url)
+            
+            # 다른 게시글이거나 URL이 다르면 이동
+            # 또는 현재 URL이 로그인 페이지나 목록 페이지인 경우도 이동
+            should_navigate = (
+                post_id_from_url != current_post_id or 
+                normalized_post_url not in current_url or
+                '/login' in current_url.lower() or
+                ('/bbs/free' in current_url.lower() and '/bbs/free/' not in current_url.lower())  # 목록 페이지
+            )
+            
+            if should_navigate:
+                logger.debug(f"게시글 페이지로 이동: {post_url} (현재: {current_url})")
+                self.driver.get(post_url)
+                time.sleep(0.6)  # 페이지 로딩 대기 (최소화)
+            else:
+                logger.debug(f"이미 해당 게시글 페이지에 있음: {current_url}")
+                time.sleep(0.2)
+            
+            # 좋아요 버튼 찾기 (온카판 사이트 구조에 맞춤)
+            like_button = None
+            
+            # 방법 1: 정확한 ID로 찾기 (가장 확실한 방법)
+            try:
+                like_button = self.driver.find_element(By.ID, "good_button")
+                logger.debug("좋아요 버튼을 ID로 찾았습니다: good_button")
+            except:
+                pass
+            
+            # 방법 2: 클래스명으로 찾기
+            if not like_button:
+                try:
+                    like_button = self.driver.find_element(By.CSS_SELECTOR, "a.bo_v_good")
+                    logger.debug("좋아요 버튼을 클래스명으로 찾았습니다: bo_v_good")
+                except:
+                    pass
+            
+            # 방법 3: thumbs-up 아이콘이 있는 링크 찾기
+            if not like_button:
+                try:
+                    # fa-thumbs-up 아이콘을 포함한 링크 찾기
+                    like_button = self.driver.find_element(By.XPATH, "//a[.//i[contains(@class, 'fa-thumbs-up')]]")
+                    logger.debug("좋아요 버튼을 thumbs-up 아이콘으로 찾았습니다")
+                except:
+                    pass
+            
+            # 방법 4: view-good-box 내부의 링크 찾기
+            if not like_button:
+                try:
+                    like_button = self.driver.find_element(By.CSS_SELECTOR, "div.view-good-box a.bo_v_good")
+                    logger.debug("좋아요 버튼을 view-good-box 내부에서 찾았습니다")
+                except:
+                    pass
+            
+            # 방법 5: href에 'good=good'이 포함된 링크 찾기
+            if not like_button:
+                try:
+                    like_button = self.driver.find_element(By.XPATH, "//a[contains(@href, 'good=good')]")
+                    logger.debug("좋아요 버튼을 href로 찾았습니다")
+                except:
+                    pass
+            
+            if not like_button:
+                logger.error("좋아요 버튼을 찾을 수 없습니다")
+                logger.debug("페이지 소스 일부:")
+                logger.debug(self.driver.page_source[:1000])
+                return False
+            
+            # 이미 좋아요를 눌렀는지 확인 (active 클래스 확인)
+            try:
+                button_class = like_button.get_attribute('class') or ''
+                if 'active' in button_class:
+                    logger.info("이미 좋아요를 누른 게시글입니다 (active 클래스 확인)")
+                    return True
+            except Exception as e:
+                logger.debug(f"active 클래스 확인 오류: {e}")
+                pass
+            
+            # 좋아요 버튼 클릭
+            try:
+                # 버튼이 보이도록 스크롤
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", like_button)
+                time.sleep(0.3)
+                
+                # 클릭 가능할 때까지 대기
+                WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable(like_button)
+                )
+                
+                # 클릭 전 좋아요 개수 저장 (성공 확인용)
+                try:
+                    good_count_elem = self.driver.find_element(By.ID, "bo_v_act_good")
+                    before_count = good_count_elem.text.strip()
+                except:
+                    before_count = None
+                
+                # JavaScript로 클릭 (일부 사이트에서 더 안정적)
+                self.driver.execute_script("arguments[0].click();", like_button)
+                logger.info("좋아요 버튼 클릭 완료")
+                
+                # 성공 여부 확인 (여러 방법으로 확인, 최대 3초 대기)
+                max_wait_time = 3.0
+                check_interval = 0.3
+                waited_time = 0
+                success_confirmed = False
+                
+                while waited_time < max_wait_time and not success_confirmed:
+                    time.sleep(check_interval)
+                    waited_time += check_interval
+                    
+                    try:
+                        # 방법 1: active 클래스 확인 (가장 확실한 방법 - 빨간불 확인)
+                        try:
+                            # 버튼을 다시 찾아서 최신 상태 확인
+                            try:
+                                current_button = self.driver.find_element(By.ID, "good_button")
+                            except:
+                                current_button = self.driver.find_element(By.CSS_SELECTOR, "a.bo_v_good")
+                            
+                            button_class = current_button.get_attribute('class') or ''
+                            if 'active' in button_class:
+                                logger.info("✅ 좋아요 클릭 성공 확인 (active 클래스 - 빨간불 확인)")
+                                success_confirmed = True
+                                break
+                        except:
+                            # JavaScript로 직접 확인
+                            try:
+                                is_active = self.driver.execute_script(
+                                    "var btn = document.getElementById('good_button') || document.querySelector('a.bo_v_good'); return btn && btn.classList.contains('active');"
+                                )
+                                if is_active:
+                                    logger.info("✅ 좋아요 클릭 성공 확인 (JavaScript - active 클래스)")
+                                    success_confirmed = True
+                                    break
+                            except:
+                                pass
+                        
+                        # 방법 2: 좋아요 개수 변경 확인
+                        if before_count:
+                            try:
+                                good_count_elem = self.driver.find_element(By.ID, "bo_v_act_good")
+                                after_count = good_count_elem.text.strip()
+                                if after_count != before_count:
+                                    try:
+                                        after_num = int(after_count.replace(',', ''))
+                                        before_num = int(before_count.replace(',', ''))
+                                        if after_num > before_num:
+                                            logger.info(f"✅ 좋아요 개수 증가 확인: {before_count} -> {after_count}")
+                                            # 개수 증가는 확인했지만 active 클래스도 확인
+                                            try:
+                                                is_active = self.driver.execute_script(
+                                                    "var btn = document.getElementById('good_button') || document.querySelector('a.bo_v_good'); return btn && btn.classList.contains('active');"
+                                                )
+                                                if is_active:
+                                                    success_confirmed = True
+                                                    break
+                                            except:
+                                                # active 확인 실패해도 개수 증가는 확인됨
+                                                success_confirmed = True
+                                                break
+                                    except ValueError:
+                                        # 숫자 변환 실패 시 텍스트만 비교
+                                        if after_count != before_count:
+                                            logger.info(f"✅ 좋아요 개수 변경 확인: {before_count} -> {after_count}")
+                                            success_confirmed = True
+                                            break
+                            except Exception as e:
+                                logger.debug(f"좋아요 개수 확인 오류: {e}")
+                        
+                        # 방법 3: 알림 메시지 확인 (페이지 소스에서)
+                        page_source = self.driver.page_source
+                        if '추천 참여 포인트가 적립되었습니다' in page_source:
+                            # 알림 메시지는 있지만 active 클래스도 확인
+                            try:
+                                is_active = self.driver.execute_script(
+                                    "var btn = document.getElementById('good_button') || document.querySelector('a.bo_v_good'); return btn && btn.classList.contains('active');"
+                                )
+                                if is_active:
+                                    logger.info("✅ 좋아요 클릭 성공 확인 (알림 메시지 + active 클래스)")
+                                    success_confirmed = True
+                                    break
+                            except:
+                                logger.info("✅ 좋아요 클릭 성공 확인 (알림 메시지)")
+                                success_confirmed = True
+                                break
+                    except Exception as e:
+                        logger.debug(f"좋아요 확인 중 오류: {e}")
+                        continue
+                
+                if not success_confirmed:
+                    # 최종 확인: active 클래스가 있는지 다시 한 번 확인
+                    try:
+                        is_active = self.driver.execute_script(
+                            "var btn = document.getElementById('good_button') || document.querySelector('a.bo_v_good'); return btn && btn.classList.contains('active');"
+                        )
+                        if is_active:
+                            logger.info("✅ 좋아요 클릭 성공 확인 (최종 확인 - active 클래스)")
+                            return True
+                    except:
+                        pass
+                    
+                    logger.warning("❌ 좋아요 클릭 성공 여부를 확인할 수 없습니다 (active 클래스 없음)")
+                    return False  # 확인 실패 시 False 반환하여 재시도 가능하도록
+                
+                return True
+                
+            except Exception as e:
+                logger.error(f"좋아요 버튼 클릭 오류: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                return False
+            
+        except Exception as e:
+            logger.error(f"좋아요 클릭 오류: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False
+        finally:
+            # 좋아요 클릭 후 최소 대기 (다음 게시글로 이동 전)
+            if not self.test_mode:
+                time.sleep(0.2)  # 최소화
+    
+    def is_logged_in(self) -> bool:
+        """
+        로그인 상태 확인
+        
+        Returns:
+            로그인 상태 (True: 로그인됨, False: 로그아웃됨)
+        """
+        try:
+            # 현재 페이지 소스에서 로그인 상태 확인
+            page_source = self.driver.page_source.lower()
+            
+            # 로그아웃 버튼이나 로그인된 사용자 정보가 있으면 로그인 상태
+            if '로그아웃' in page_source or 'logout' in page_source:
+                return True
+            
+            # 로그인 페이지에 있으면 로그아웃 상태
+            if 'login' in self.driver.current_url.lower() and 'mb_id' in page_source:
+                return False
+            
+            # 메인 페이지나 게시판 페이지에서 로그인 폼이 없으면 로그인 상태로 간주
+            if 'mb_id' not in page_source and 'mb_password' not in page_source:
+                return True
+            
+            return False
+        except Exception as e:
+            logger.warning(f"로그인 상태 확인 오류: {e}")
+            # 확인 실패 시 True 반환 (안전하게 로그인 상태로 간주)
+            return True
+    
+    def check_cloudflare_block(self) -> bool:
+        """
+        Cloudflare 차단 여부 확인
+        
+        Returns:
+            True: 차단됨, False: 정상
+        """
+        try:
+            page_source = self.driver.page_source.lower()
+            current_url = self.driver.current_url.lower()
+            
+            # Cloudflare 관련 키워드 확인
+            cloudflare_indicators = [
+                'cloudflare',
+                'challenge',
+                'checking your browser',
+                'just a moment',
+                'ddos protection',
+                'access denied'
+            ]
+            
+            for indicator in cloudflare_indicators:
+                if indicator in page_source or indicator in current_url:
+                    return True
+            
+            return False
+        except Exception as e:
+            logger.warning(f"Cloudflare 차단 확인 오류: {e}")
             return False
     
     def close(self):

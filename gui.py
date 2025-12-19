@@ -142,7 +142,7 @@ class MacroGUI:
             test_label = ttk.Label(test_frame, text="⚠️ 테스트 모드로만 실행됩니다", foreground="orange")
             test_label.pack(pady=(5, 0))
         
-        # 모드 선택 (매크로 모드 / 학습 모드)
+        # 모드 선택 (매크로 모드 / 학습 모드 / 좋아요 모드)
         mode_frame = ttk.LabelFrame(main_frame, text="실행 모드", padding="10")
         mode_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
@@ -151,10 +151,12 @@ class MacroGUI:
                        variable=self.mode_var, value="macro").pack(side=tk.LEFT, padx=10)
         ttk.Radiobutton(mode_frame, text="📚 학습 모드 (댓글 수집만)", 
                        variable=self.mode_var, value="learning").pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(mode_frame, text="👍 좋아요 모드 (좋아요만)", 
+                       variable=self.mode_var, value="like").pack(side=tk.LEFT, padx=10)
         
         # 버튼 프레임
         button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=5, column=0, columnspan=2, pady=10)
+        button_frame.grid(row=6, column=0, columnspan=2, pady=10)
         
         self.save_btn = ttk.Button(button_frame, text="설정 저장", command=self.save_config)
         self.save_btn.pack(side=tk.LEFT, padx=5)
@@ -167,20 +169,20 @@ class MacroGUI:
         
         # 로그 영역
         log_frame = ttk.LabelFrame(main_frame, text="실행 로그", padding="10")
-        log_frame.grid(row=6, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        log_frame.grid(row=7, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
         
         self.log_text = scrolledtext.ScrolledText(log_frame, height=15, width=70, state=tk.DISABLED)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         
         # 상태바
         self.status_label = ttk.Label(main_frame, text="대기 중...", relief=tk.SUNKEN)
-        self.status_label.grid(row=7, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        self.status_label.grid(row=8, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         
         # 그리드 가중치 설정
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(6, weight=1)
+        main_frame.rowconfigure(7, weight=1)
     
     def log(self, message: str):
         """로그 메시지 추가"""
@@ -270,10 +272,17 @@ class MacroGUI:
         username = self.username_entry.get().strip()
         password = self.password_entry.get().strip()
         api_key = self.api_key_entry.get().strip()
+        mode = self.mode_var.get()
         
-        if not username or not password or not api_key:
-            messagebox.showwarning("경고", "모든 필드를 입력해주세요.")
-            return
+        # 좋아요 모드는 API 키 불필요
+        if mode == "like":
+            if not username or not password:
+                messagebox.showwarning("경고", "아이디와 비밀번호를 입력해주세요.")
+                return
+        else:
+            if not username or not password or not api_key:
+                messagebox.showwarning("경고", "모든 필드를 입력해주세요.")
+                return
         
         try:
             delay = int(self.delay_entry.get())
@@ -311,17 +320,30 @@ class MacroGUI:
         self.min_delay_entry.config(state='readonly')
         self.max_delay_entry.config(state='readonly')
         
-        # 워커 스레드 시작
-        self.worker_thread = threading.Thread(
-            target=self.macro_worker,
-            args=(username, password, api_key, delay, min_delay, max_delay, limit_mode, limit_count),
-            daemon=True
-        )
-        self.worker_thread.start()
-        
-        limit_text = "무한정" if limit_mode == "unlimited" else f"{limit_count}번"
-        self.log(f"매크로를 시작합니다... (제한: {limit_text})")
-        self.status_label.config(text=f"실행 중... (제한: {limit_text})")
+        # 모드에 따라 워커 선택
+        mode = self.mode_var.get()
+        if mode == "like":
+            # 좋아요 전용 모드 (설정값 없이 고정값 사용)
+            # 좋아요 전용 모드
+            self.worker_thread = threading.Thread(
+                target=self.like_worker,
+                args=(username, password, delay),
+                daemon=True
+            )
+            self.worker_thread.start()
+            self.log(f"좋아요 모드를 시작합니다... (24시간 이내 게시글 오래된 것부터 순차 처리)")
+            self.status_label.config(text="좋아요 모드 실행 중...")
+        else:
+            # 기존 매크로/학습 모드
+            self.worker_thread = threading.Thread(
+                target=self.macro_worker,
+                args=(username, password, api_key, delay, min_delay, max_delay, limit_mode, limit_count),
+                daemon=True
+            )
+            self.worker_thread.start()
+            limit_text = "무한정" if limit_mode == "unlimited" else f"{limit_count}번"
+            self.log(f"매크로를 시작합니다... (제한: {limit_text})")
+            self.status_label.config(text=f"실행 중... (제한: {limit_text})")
     
     def stop_macro(self):
         """매크로 중지"""
@@ -873,6 +895,498 @@ class MacroGUI:
             logger.error(f"댓글 작성 이력 저장 실패: {e}")
             import traceback
             logger.debug(traceback.format_exc())
+            # 임시 파일 정리
+            try:
+                if os.path.exists(temp_filename):
+                    os.remove(temp_filename)
+            except:
+                pass
+    
+    def like_worker(self, username: str, password: str, delay: int):
+        """좋아요 전용 워커 스레드"""
+        max_retries = 3
+        retry_count = 0
+        last_login_check = time.time()
+        LOGIN_CHECK_INTERVAL = 300  # 5분마다 로그인 상태 확인
+        cloudflare_block_count = 0
+        MAX_CLOUDFLARE_BLOCKS = 3  # Cloudflare 차단 최대 횟수
+        
+        # 좋아요 클릭 실패 추적 (게시글별)
+        failed_posts = {}  # {post_id: failure_count}
+        MAX_FAILURES = 3  # 최대 실패 횟수
+        
+        while self.is_running and retry_count < max_retries:
+            try:
+                # 스크래퍼 초기화
+                # 좋아요 모드는 항상 실제 모드로 실행 (테스트 모드 체크박스 무시)
+                test_mode = False  # 좋아요 모드는 항상 실제 모드
+                self.scraper = OncaPanScraper(test_mode=test_mode)
+                
+                # 실제 모드로 실행
+                self.root.after(0, partial(self.log, "✅ 실제 모드로 실행됩니다. 실제 좋아요를 누릅니다."))
+                logger.info("좋아요 모드: 실제 모드 활성화 (테스트 모드 체크박스 무시)")
+                
+                # 로그인 시도
+                self.root.after(0, partial(self.log, "로그인 시도 중..."))
+                if not self.scraper.login(username, password):
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        self.root.after(0, partial(self.log, f"로그인 실패. 재시도 중... ({retry_count}/{max_retries})"))
+                        time.sleep(5)
+                        continue
+                    else:
+                        self.root.after(0, partial(self.log, "로그인 실패. 좋아요 모드를 중지합니다."))
+                        self.root.after(0, self.stop_macro)
+                        return
+                
+                self.root.after(0, partial(self.log, "로그인 성공!"))
+                retry_count = 0
+                last_login_check = time.time()
+                cloudflare_block_count = 0
+                
+                # 좋아요를 누른 게시글 목록 로드
+                try:
+                    if getattr(sys, 'frozen', False):
+                        base_path = os.path.dirname(sys.executable)
+                    else:
+                        base_path = os.path.dirname(os.path.abspath(__file__))
+                except:
+                    base_path = os.getcwd()
+                
+                liked_posts_file = os.path.join(base_path, "liked_posts.json")
+                liked_posts = self._load_liked_posts(liked_posts_file)
+                if liked_posts:
+                    self.root.after(0, partial(self.log, f"👍 이전 좋아요 이력 로드: {len(liked_posts)}개 게시글"))
+                
+                # 좋아요 카운터
+                like_count = 0
+                save_counter = 0
+                SAVE_INTERVAL = 5  # 5개마다 저장
+                
+                # 초기 실행 여부 (모든 24시간 이내 게시글 처리 완료 여부)
+                initial_processing_done = False
+                
+                # 메인 루프
+                while self.is_running:
+                    try:
+                        # 주기적으로 로그인 상태 확인
+                        current_time = time.time()
+                        if current_time - last_login_check >= LOGIN_CHECK_INTERVAL:
+                            self.root.after(0, partial(self.log, "🔍 로그인 상태 확인 중..."))
+                            if not self.scraper.is_logged_in():
+                                self.root.after(0, partial(self.log, "⚠️ 로그아웃 상태 감지. 재로그인 시도..."))
+                                if not self.scraper.login(username, password):
+                                    self.root.after(0, partial(self.log, "❌ 재로그인 실패. 좋아요 모드를 중지합니다."))
+                                    self.root.after(0, self.stop_macro)
+                                    break
+                                else:
+                                    self.root.after(0, partial(self.log, "✅ 재로그인 성공!"))
+                            last_login_check = current_time
+                        
+                        # Cloudflare 차단 확인
+                        if self.scraper.check_cloudflare_block():
+                            cloudflare_block_count += 1
+                            self.root.after(0, partial(self.log, f"⚠️ Cloudflare 차단 감지 ({cloudflare_block_count}/{MAX_CLOUDFLARE_BLOCKS})"))
+                            
+                            if cloudflare_block_count >= MAX_CLOUDFLARE_BLOCKS:
+                                self.root.after(0, partial(self.log, "❌ Cloudflare 차단이 지속됩니다. 좋아요 모드를 중지합니다."))
+                                self.root.after(0, self.stop_macro)
+                                break
+                            
+                            # 차단 감지 시 대기
+                            self.root.after(0, partial(self.log, "⏳ 30초 대기 후 재시도..."))
+                            time.sleep(30)
+                            continue
+                        else:
+                            cloudflare_block_count = 0  # 정상 상태면 카운터 리셋
+                        
+                        # 게시글 목록 가져오기 (24시간 이내 모든 게시글, 오래된 것부터)
+                        # limit을 매우 크게 설정하여 모든 24시간 이내 게시글 가져오기
+                        posts = self.scraper.get_post_list(limit=10000)
+                        
+                        if not posts:
+                            self.root.after(0, partial(self.log, "게시글이 없습니다. 30초 후 다시 시도합니다."))
+                            time.sleep(30)
+                            continue
+                        
+                        # 좋아요를 누르지 않은 게시글만 필터링
+                        # 실패 횟수가 너무 많은 게시글은 제외
+                        # 정렬 순서 유지 (오래된 것부터)
+                        new_posts = [
+                            post for post in posts 
+                            if post.get('id') not in liked_posts 
+                            and failed_posts.get(post.get('id'), 0) < MAX_FAILURES
+                        ]
+                        
+                        # 정렬 순서 확인 및 로깅 (처음 게시글의 날짜 확인)
+                        if new_posts and len(new_posts) > 0:
+                            first_post = new_posts[0]
+                            last_post = new_posts[-1]
+                            first_date = first_post.get('datetime', '날짜 없음')
+                            last_date = last_post.get('datetime', '날짜 없음')
+                            logger.debug(f"처리 순서 확인 - 첫 게시글: {first_date}, 마지막 게시글: {last_date}")
+                        
+                        if not new_posts:
+                            skipped_count = sum(1 for post in posts if failed_posts.get(post.get('id'), 0) >= MAX_FAILURES)
+                            
+                            if not initial_processing_done:
+                                # 처음 모든 24시간 이내 게시글 처리 완료
+                                initial_processing_done = True
+                                self.root.after(0, partial(self.log, f"✅ 모든 24시간 이내 게시글에 좋아요 완료! (전체: {len(posts)}개, 좋아요: {len(liked_posts)}개, 실패 건너뛰기: {skipped_count}개)"))
+                                self.root.after(0, partial(self.log, f"🔄 이제 새로운 게시글만 확인합니다..."))
+                            else:
+                                # 이후 새로운 게시글만 확인
+                                self.root.after(0, partial(self.log, f"📋 새로운 게시글 없음 (현재 좋아요: {len(liked_posts)}개)"))
+                            
+                            self.root.after(0, partial(self.log, f"⏳ 30초 후 다시 확인합니다..."))
+                            time.sleep(30)  # 새로운 게시글 확인 주기 (30초)
+                            continue
+                        
+                        # 처음 실행 시 안내
+                        if not initial_processing_done and len(new_posts) > 0:
+                            self.root.after(0, partial(self.log, f"📋 24시간 이내 게시글 {len(new_posts)}개 발견 (오래된 것부터 순차 처리)"))
+                        
+                        self.root.after(0, partial(self.log, f"📋 처리할 게시글: {len(new_posts)}개"))
+                        
+                        # 각 게시글 처리
+                        for post in new_posts:
+                            if not self.is_running:
+                                break
+                            
+                            post_id = post.get('id')
+                            post_url = post.get('url')
+                            
+                            if not post_id or not post_url:
+                                continue
+                            
+                            # 이미 좋아요를 누른 게시글은 건너뛰기
+                            if post_id in liked_posts:
+                                continue
+                            
+                            # 24시간 이내 게시글인지 확인
+                            # (get_post_list에서 이미 필터링하지만, 안전장치로 다시 확인)
+                            post_datetime_str = post.get('datetime')
+                            post_datetime_obj = post.get('datetime_obj')  # get_post_list에서 파싱된 datetime 객체
+                            
+                            if post_datetime_obj:
+                                # 이미 파싱된 datetime 객체 사용
+                                now = datetime.now()
+                                time_diff = now - post_datetime_obj
+                                if time_diff > timedelta(hours=24):
+                                    self.root.after(0, partial(self.log, f"⏰ 24시간 초과 게시글 건너뛰기: {post.get('title', '')[:30]}"))
+                                    continue
+                            elif post_datetime_str:
+                                # datetime 객체가 없으면 문자열 파싱
+                                try:
+                                    now = datetime.now()
+                                    post_date = None
+                                    
+                                    # 날짜 파싱
+                                    date_formats = [
+                                        '%Y-%m-%d %H:%M:%S',
+                                        '%Y-%m-%d %H:%M',
+                                        '%Y-%m-%d',
+                                        '%m-%d %H:%M',
+                                        '%m-%d',
+                                    ]
+                                    
+                                    for fmt in date_formats:
+                                        try:
+                                            post_date = datetime.strptime(post_datetime_str.strip(), fmt)
+                                            if '%Y' not in fmt:
+                                                post_date = post_date.replace(year=now.year)
+                                                if post_date > now:
+                                                    post_date = post_date.replace(year=now.year - 1)
+                                            break
+                                        except ValueError:
+                                            continue
+                                    
+                                    if post_date:
+                                        time_diff = now - post_date
+                                        if time_diff > timedelta(hours=24):
+                                            self.root.after(0, partial(self.log, f"⏰ 24시간 초과 게시글 건너뛰기: {post.get('title', '')[:30]}"))
+                                            continue
+                                        
+                                except Exception as e:
+                                    logger.debug(f"날짜 파싱 실패: {post_datetime_str}, 오류: {e}")
+                                    # 날짜 파싱 실패 시 계속 진행 (get_post_list에서 이미 필터링했을 가능성)
+                                    pass
+                            
+                            # 게시글 제목 표시
+                            post_title = post.get('title', '')[:50]
+                            self.root.after(0, partial(self.log, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
+                            self.root.after(0, partial(self.log, f"📄 【게시글】 {post_title}"))
+                            
+                            # 좋아요 클릭 시도 (재시도 로직 포함)
+                            max_retries = 2
+                            like_success = False
+                            
+                            for attempt in range(max_retries):
+                                try:
+                                    if attempt == 0:
+                                        self.root.after(0, partial(self.log, f"👍 좋아요 클릭 시도 중..."))
+                                    else:
+                                        self.root.after(0, partial(self.log, f"🔄 좋아요 클릭 재시도 중... ({attempt + 1}/{max_retries})"))
+                                    
+                                    # 테스트 모드 확인 (스크래퍼의 test_mode 속성 확인)
+                                    scraper_test_mode = getattr(self.scraper, 'test_mode', False) if self.scraper else False
+                                    
+                                    if scraper_test_mode:
+                                        # 테스트 모드: 시뮬레이션만
+                                        like_success = True
+                                        self.root.after(0, partial(self.log, f"🧪 [테스트 모드] 좋아요 클릭 시뮬레이션"))
+                                        logger.debug(f"테스트 모드: 좋아요 시뮬레이션 - {post_url}")
+                                        break
+                                    else:
+                                        # 실제 모드: 좋아요 클릭
+                                        logger.debug(f"실제 모드: 좋아요 클릭 시도 - {post_url}")
+                                        like_success = self.scraper.click_like(post_url)
+                                        
+                                        if like_success:
+                                            logger.info(f"좋아요 클릭 성공: {post_url}")
+                                            break
+                                        elif attempt < max_retries - 1:
+                                            # 재시도 전 대기
+                                            logger.warning(f"좋아요 클릭 실패, 재시도 예정: {post_url}")
+                                            time.sleep(1)
+                                            continue
+                                        else:
+                                            logger.error(f"좋아요 클릭 최종 실패: {post_url}")
+                                
+                                except Exception as e:
+                                    error_msg = str(e)
+                                    # 네트워크 오류인지 확인
+                                    is_network_error = any(keyword in error_msg.lower() for keyword in [
+                                        'timeout', 'connection', 'network', 'unreachable', 'refused'
+                                    ])
+                                    
+                                    if is_network_error and attempt < max_retries - 1:
+                                        self.root.after(0, partial(self.log, f"🌐 네트워크 오류 감지 (재시도 예정): {error_msg[:50]}"))
+                                        time.sleep(2)  # 네트워크 오류는 더 길게 대기
+                                        continue
+                                    elif attempt < max_retries - 1:
+                                        self.root.after(0, partial(self.log, f"⚠️ 좋아요 클릭 오류 (재시도 예정): {error_msg[:50]}"))
+                                        time.sleep(1)
+                                        continue
+                                    else:
+                                        self.root.after(0, partial(self.log, f"❌ 좋아요 클릭 오류: {error_msg}"))
+                                        logger.error(f"좋아요 클릭 예외 발생: {e}", exc_info=True)
+                            
+                            if like_success:
+                                # 성공 시에만 목록에 추가
+                                liked_posts.add(post_id)
+                                # 실패 카운터 초기화
+                                if post_id in failed_posts:
+                                    del failed_posts[post_id]
+                                like_count += 1
+                                save_counter += 1
+                                
+                                # 배치 저장
+                                if save_counter >= SAVE_INTERVAL:
+                                    self._save_liked_posts(liked_posts, liked_posts_file)
+                                    save_counter = 0
+                                
+                                self.root.after(0, partial(self.log, f"✅ 좋아요 클릭 완료 ({like_count}번째)"))
+                                self.root.after(0, partial(self.status_label.config, text=f"좋아요 완료: {like_count}개"))
+                            else:
+                                # 실패 횟수 증가
+                                failed_posts[post_id] = failed_posts.get(post_id, 0) + 1
+                                failure_count = failed_posts[post_id]
+                                
+                                if failure_count >= MAX_FAILURES:
+                                    self.root.after(0, partial(self.log, f"⏭️ 좋아요 클릭 실패 {failure_count}회 - 해당 게시글 건너뛰기"))
+                                    # 실패 횟수가 많으면 일시적으로 건너뛰기 (다음 새로고침에서 다시 시도)
+                                else:
+                                    self.root.after(0, partial(self.log, f"❌ 좋아요 클릭 실패 ({failure_count}/{MAX_FAILURES})"))
+                                
+                                # 실패해도 목록에 추가하지 않음 (재시도 가능)
+                            
+                            self.root.after(0, partial(self.log, f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
+                            
+                            # 게시글 간 대기 시간 (최소화)
+                            # 좋아요 클릭 후 최소한의 대기만 (빠른 처리)
+                            scraper_test_mode = getattr(self.scraper, 'test_mode', False) if self.scraper else False
+                            if not scraper_test_mode:
+                                time.sleep(0.3)  # 좋아요 처리 완료 대기 (최소화)
+                            
+                            # delay는 최소값으로 사용 (너무 오래 기다리지 않음)
+                            min_delay = max(0.5, delay * 0.3)  # 원래 delay의 30% 또는 최소 0.5초
+                            time.sleep(min_delay)
+                        
+                        # 남은 변경사항 저장
+                        if save_counter > 0:
+                            self._save_liked_posts(liked_posts, liked_posts_file)
+                            save_counter = 0
+                        
+                        # 실패 카운터 정리 (오래된 실패 기록 제거)
+                        if len(failed_posts) > 1000:
+                            # 가장 오래된 실패 기록 제거 (간단히 일부만 유지)
+                            failed_posts = dict(list(failed_posts.items())[-500:])
+                            logger.debug("실패 카운터 정리 완료")
+                        
+                        # 모든 게시글 처리 완료 후 새로운 게시글 확인
+                        # (위의 continue에서 이미 처리됨)
+                        
+                    except Exception as e:
+                        logger.error(f"게시글 처리 오류: {e}", exc_info=True)
+                        error_msg = f"오류 발생: {str(e)}"
+                        self.root.after(0, partial(self.log, error_msg))
+                        time.sleep(10)
+                        continue
+                
+            except Exception as e:
+                logger.error(f"좋아요 작업 오류: {e}", exc_info=True)
+                error_msg = f"심각한 오류 발생: {str(e)}"
+                self.root.after(0, partial(self.log, error_msg))
+                retry_count += 1
+                if retry_count < max_retries:
+                    self.root.after(0, partial(self.log, f"재시도 중... ({retry_count}/{max_retries})"))
+                    time.sleep(10)
+                else:
+                    self.root.after(0, partial(self.log, "최대 재시도 횟수 초과. 좋아요 모드를 중지합니다."))
+                    self.root.after(0, self.stop_macro)
+                    break
+            finally:
+                if self.scraper:
+                    self.scraper.close()
+    
+    def _load_liked_posts(self, filename: str) -> set:
+        """좋아요를 누른 게시글 목록 로드 (오래된 이력 자동 정리)"""
+        try:
+            if os.path.exists(filename):
+                with open(filename, 'r', encoding='utf-8') as f:
+                    # 파일 락
+                    try:
+                        if os.name == 'nt':
+                            try:
+                                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                            except NameError:
+                                pass
+                        else:
+                            try:
+                                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                            except NameError:
+                                pass
+                    except:
+                        pass
+                    
+                    data = json.load(f)
+                    
+                    # 락 해제
+                    try:
+                        if os.name == 'nt':
+                            try:
+                                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                            except NameError:
+                                pass
+                        else:
+                            try:
+                                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                            except NameError:
+                                pass
+                    except:
+                        pass
+                    
+                    if isinstance(data, list):
+                        post_ids = set(data)
+                        last_updated = None
+                    elif isinstance(data, dict) and 'post_ids' in data:
+                        post_ids = set(data['post_ids'])
+                        last_updated = data.get('last_updated')
+                    else:
+                        post_ids = set()
+                        last_updated = None
+                    
+                    # 파일 크기 관리: 최대 50000개만 유지
+                    MAX_POSTS = 50000
+                    if len(post_ids) > MAX_POSTS:
+                        # 최신 것만 유지 (FIFO 방식)
+                        post_ids = set(list(post_ids)[-MAX_POSTS:])
+                        logger.info(f"좋아요 이력이 {MAX_POSTS}개를 초과하여 최신 {MAX_POSTS}개만 유지합니다.")
+                    
+                    # 오래된 이력 자동 정리 (30일 이상 된 이력은 제거)
+                    # (실제로는 게시글 ID만 저장하므로 날짜 정보가 없지만,
+                    #  파일이 너무 오래되면 정리하는 로직 추가 가능)
+                    if last_updated:
+                        try:
+                            last_update_date = datetime.strptime(last_updated, "%Y-%m-%d %H:%M:%S")
+                            days_since_update = (datetime.now() - last_update_date).days
+                            if days_since_update > 30 and len(post_ids) > 10000:
+                                # 30일 이상 업데이트가 없고 이력이 많으면 일부 정리
+                                post_ids = set(list(post_ids)[-10000:])
+                                logger.info(f"오래된 좋아요 이력 정리: {days_since_update}일 경과, {len(post_ids)}개만 유지")
+                        except:
+                            pass
+                    
+                    return post_ids
+            return set()
+        except Exception as e:
+            logger.warning(f"좋아요 이력 로드 실패: {e}")
+            return set()
+    
+    def _save_liked_posts(self, liked_posts: set, filename: str):
+        """좋아요를 누른 게시글 목록 저장"""
+        try:
+            # 파일 크기 관리: 최대 50000개만 유지
+            MAX_POSTS = 50000
+            if len(liked_posts) > MAX_POSTS:
+                liked_posts = set(list(liked_posts)[-MAX_POSTS:])
+                logger.info(f"좋아요 이력이 {MAX_POSTS}개를 초과하여 최신 {MAX_POSTS}개만 유지합니다.")
+            
+            data = {
+                'post_ids': list(liked_posts),
+                'count': len(liked_posts),
+                'last_updated': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            # 임시 파일로 저장 후 원자적 이동
+            temp_filename = filename + '.tmp'
+            with open(temp_filename, 'w', encoding='utf-8') as f:
+                # 파일 락
+                try:
+                    if os.name == 'nt':
+                        try:
+                            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                        except NameError:
+                            pass
+                    else:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                        except NameError:
+                            pass
+                except:
+                    pass
+                
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+                
+                # 락 해제
+                try:
+                    if os.name == 'nt':
+                        try:
+                            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                        except NameError:
+                            pass
+                    else:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        except NameError:
+                            pass
+                except:
+                    pass
+            
+            # 원자적 이동
+            if os.name == 'nt':
+                if os.path.exists(filename):
+                    os.replace(temp_filename, filename)
+                else:
+                    os.rename(temp_filename, filename)
+            else:
+                os.replace(temp_filename, filename)
+                
+        except Exception as e:
+            logger.error(f"좋아요 이력 저장 실패: {e}")
             # 임시 파일 정리
             try:
                 if os.path.exists(temp_filename):

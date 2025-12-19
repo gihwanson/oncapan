@@ -121,6 +121,10 @@ class AICommentGenerator:
         self.last_stats_save = time.time()
         self.stats_dirty = False  # 통계 변경 여부
         
+        # 좋아요 데이터 로드
+        self.likes: Dict[str, bool] = {}  # post_id -> True (좋아요 누름)
+        self._load_likes()
+        
         logger.info(f"AICommentGenerator 초기화 완료 (프롬프트: {prompt_version}, 풀: {len(self.comment_pool)}개)")
     
     def _init_file_paths(self):
@@ -133,6 +137,7 @@ class AICommentGenerator:
         self.stats_file = os.path.join(base_path, "stats.json")
         self.comment_pool_file = os.path.join(base_path, "comment_pool.json")
         self.prompts_dir = os.path.join(base_path, "prompts")
+        self.likes_file = os.path.join(base_path, "likes.json")
     
     def _load_comment_pool(self):
         """댓글 풀 파일 로드 (파일 락 사용)"""
@@ -1226,3 +1231,147 @@ class AICommentGenerator:
     def save_stats_now(self):
         """통계 즉시 저장 (프로그램 종료 시 호출)"""
         self._save_stats(force=True)
+    
+    def _load_likes(self):
+        """좋아요 데이터 로드"""
+        try:
+            if os.path.exists(self.likes_file):
+                with open(self.likes_file, 'r', encoding='utf-8') as f:
+                    # 파일 락
+                    try:
+                        if os.name == 'nt':
+                            try:
+                                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                            except NameError:
+                                pass
+                        else:
+                            try:
+                                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                            except NameError:
+                                pass
+                    except:
+                        pass
+                    
+                    data = json.load(f)
+                    self.likes = {k: v for k, v in data.items() if v is True}
+                    
+                    # 락 해제
+                    try:
+                        if os.name == 'nt':
+                            try:
+                                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                            except NameError:
+                                pass
+                        else:
+                            try:
+                                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                            except NameError:
+                                pass
+                    except:
+                        pass
+                    
+                    logger.info(f"좋아요 데이터 로드 완료: {len(self.likes)}개")
+            else:
+                self.likes = {}
+                logger.info("좋아요 데이터 파일이 없습니다. 새로 생성합니다.")
+        except Exception as e:
+            logger.error(f"좋아요 데이터 로드 오류: {e}")
+            self.likes = {}
+    
+    def _save_likes(self):
+        """좋아요 데이터 저장"""
+        try:
+            temp_file = self.likes_file + '.tmp'
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                # 파일 락
+                try:
+                    if os.name == 'nt':
+                        try:
+                            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                        except NameError:
+                            pass
+                    else:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                        except NameError:
+                            pass
+                except:
+                    pass
+                
+                json.dump(self.likes, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+                
+                # 락 해제
+                try:
+                    if os.name == 'nt':
+                        try:
+                            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                        except NameError:
+                            pass
+                    else:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        except NameError:
+                            pass
+                except:
+                    pass
+            
+            # 원자적 이동
+            if os.path.exists(self.likes_file):
+                os.replace(temp_file, self.likes_file)
+            else:
+                os.rename(temp_file, self.likes_file)
+            
+            logger.debug("좋아요 데이터 저장 완료")
+        except Exception as e:
+            logger.error(f"좋아요 데이터 저장 오류: {e}")
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except:
+                pass
+    
+    def toggle_like(self, post_id: str) -> bool:
+        """
+        좋아요 토글 (누르기/취소)
+        
+        Args:
+            post_id: 게시글 ID
+        
+        Returns:
+            좋아요 상태 (True: 좋아요 누름, False: 좋아요 취소)
+        """
+        if not post_id:
+            return False
+        
+        if post_id in self.likes and self.likes[post_id]:
+            # 좋아요 취소
+            del self.likes[post_id]
+            self._save_likes()
+            logger.info(f"좋아요 취소: {post_id}")
+            return False
+        else:
+            # 좋아요 누르기
+            self.likes[post_id] = True
+            self._save_likes()
+            logger.info(f"좋아요 누름: {post_id}")
+            return True
+    
+    def is_liked(self, post_id: str) -> bool:
+        """
+        좋아요 상태 확인
+        
+        Args:
+            post_id: 게시글 ID
+        
+        Returns:
+            좋아요 상태 (True: 좋아요 누름, False: 좋아요 안 누름)
+        """
+        if not post_id:
+            return False
+        return self.likes.get(post_id, False)
+    
+    def get_likes_count(self) -> int:
+        """전체 좋아요 개수 반환"""
+        return len(self.likes)
